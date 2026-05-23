@@ -57,35 +57,13 @@ def extract_text_from_pdf(pdf_path: str, password: str = None) -> Tuple[str, int
     with pdfplumber.open(pdf_path, password=password) as pdf:
         total_pages = len(pdf.pages)
         for page in pdf.pages:
-            page_text_parts = []
-
-            # Strategy 1: Try structured table extraction first
             try:
-                tables = page.extract_tables()
-                if tables:
-                    for table in tables:
-                        for row in table:
-                            if row:
-                                clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
-                                if any(clean_row):
-                                    page_text_parts.append("\t".join(clean_row))
-            except Exception:
-                pass
-
-            # Strategy 2: Layout-aware text extraction as fallback or supplement
-            try:
+                # Fast layout-aware extraction for Gemini AI
                 text = page.extract_text(layout=True)
-                if text and not page_text_parts:
-                    page_text_parts.append(text)
-                elif text and page_text_parts:
-                    # If table gave very little, supplement with full text
-                    if len("\n".join(page_text_parts)) < 100:
-                        page_text_parts = [text]
+                if text:
+                    extracted_pages.append(text)
             except Exception:
                 pass
-
-            if page_text_parts:
-                extracted_pages.append("\n".join(page_text_parts))
 
     return "\n\n--- Page Break ---\n\n".join(extracted_pages), total_pages
 
