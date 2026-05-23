@@ -191,6 +191,7 @@ async def convert_statement(
         
         # 2. Use Gemini AI as primary parser for 100% accuracy across all banks
         raw_txns = []
+        gemini_error = ""
         print(f"Using Gemini AI for maximum accuracy: {file.filename}")
         try:
             limited_text = text[:600000]
@@ -198,6 +199,7 @@ async def convert_statement(
             if raw_txns:
                 print(f"Gemini AI extraction succeeded! Extracted {len(raw_txns)} transactions.")
         except Exception as e:
+            gemini_error = str(e)
             print(f"Gemini AI failed: {e}. Falling back to native parser...")
 
         # Fallback to native parser only if Gemini fails (API unavailable, quota, etc.)
@@ -211,9 +213,12 @@ async def convert_statement(
                 raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
 
         if not raw_txns:
+            error_msg = "No transaction entries could be detected in this bank statement."
+            if gemini_error:
+                error_msg += f" AI Parser failed with: {gemini_error}."
             raise HTTPException(
                 status_code=422,
-                detail="No transaction entries could be detected in this bank statement. Try checking your PDF or choose a standard format."
+                detail=error_msg
             )
 
         # 3. Clean and format using pandas

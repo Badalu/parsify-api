@@ -653,7 +653,16 @@ def _call_gemini_chunk(
                         temperature=0,
                     )
                 )
-                raw = response.text
+            raw = response.text
+            # Clean up potential markdown formatting
+            raw = raw.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            if raw.startswith("```"):
+                raw = raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
 
             data = json.loads(raw)
             txns = data.get("transactions", [])
