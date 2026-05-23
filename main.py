@@ -251,6 +251,18 @@ async def convert_batch(
         except Exception:
             pass
 
+    if not user:
+        raise HTTPException(status_code=403, detail="Anonymous conversions are not allowed for batch processing.")
+    
+    if supabase:
+        profile_res = supabase.table("profiles").select("tier").eq("id", user["id"]).execute()
+        tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
+        if tier != "subscribed":
+            raise HTTPException(
+                status_code=403,
+                detail="Bulk conversion is a premium feature. Please upgrade to a Starter, Professional, or Business plan to use it."
+            )
+
     async def process_file(idx: int, file: UploadFile):
         temp_dir = tempfile.gettempdir()
         temp_file_path = os.path.join(temp_dir, f"batch_upload_{idx}_{file.filename}")
