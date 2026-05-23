@@ -33,13 +33,13 @@ GEMINI_MAX_WORKERS = 4
 # Define schemas for structured Gemini output
 class TransactionItem(BaseModel):
     date: str = Field(description="The posting date of the transaction (exactly as listed in the statement)")
-    value_date: str = Field(default="", description="The value date or clearing date of the transaction if explicitly listed in the statement, else same as date")
+    value_date: str = Field(description="The value date or clearing date of the transaction if explicitly listed in the statement, else same as date")
     description: str = Field(description="The description or particulars of the transaction")
-    debit: str = Field(default="", description="The debit amount (withdrawal), normalized without currency symbols, empty if none")
-    credit: str = Field(default="", description="The credit amount (deposit), normalized without currency symbols, empty if none")
-    balance: str = Field(default="", description="The running balance after transaction, empty if none")
-    category: str = Field(default="Other", description="Assigned category: Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other")
-    gst: str = Field(default="", description="If GST splits are found, e.g. 'CGST+SGST', else empty")
+    debit: str = Field(description="The debit amount (withdrawal), normalized without currency symbols, empty if none")
+    credit: str = Field(description="The credit amount (deposit), normalized without currency symbols, empty if none")
+    balance: str = Field(description="The running balance after transaction, empty if none")
+    category: str = Field(description="Assigned category: Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other")
+    gst: str = Field(description="If GST splits are found, e.g. 'CGST+SGST', else empty")
 
 class TransactionsList(BaseModel):
     transactions: List[TransactionItem]
