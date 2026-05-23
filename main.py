@@ -144,6 +144,34 @@ async def convert_statement(
                     status_code=403,
                     detail="Anonymous conversions are limited to 1 page. Please sign up for a free account to convert longer statements!"
                 )
+        else:
+            if supabase:
+                try:
+                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date").eq("id", user["id"]).execute()
+                    tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
+                    expiry_date_str = profile_res.data[0].get("premium_expiry_date") if profile_res.data else None
+                    
+                    if tier == "subscribed" and expiry_date_str:
+                        from datetime import datetime, timezone
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        if expiry_date_str < now_iso:
+                            tier = "registered"
+                    
+                    if tier != "subscribed":
+                        from datetime import datetime, timezone
+                        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
+                        pages_today = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
+                        
+                        if pages_today + page_count > 5:
+                            raise HTTPException(
+                                status_code=403,
+                                detail=f"Daily limit exceeded. You have {max(0, 5 - pages_today)} pages left today, but this document has {page_count} pages. Upgrade to Pro for more."
+                            )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    print(f"Failed to check quota: {e}")
         
         # 2. Use Gemini AI as primary parser for 100% accuracy across all banks
         raw_txns = []
