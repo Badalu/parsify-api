@@ -9,8 +9,10 @@ from typing import Optional, List
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# Load variables
-load_dotenv()
+# Load variables from the directory where main.py is located
+from pathlib import Path
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 from parser import extract_text_from_pdf, parse_pdf_natively, parse_with_gemini, clean_and_format_transactions, generate_excel_file, generate_csv_file
 from supabase import create_client, Client
@@ -68,6 +70,7 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
             }
     except Exception as e:
         print(f"Token verification error: {e}")
+        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
     return None
 
 class TransactionSchema(BaseModel):
@@ -147,9 +150,10 @@ async def convert_statement(
         else:
             if supabase:
                 try:
-                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date").eq("id", user["id"]).execute()
+                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date, credits").eq("id", user["id"]).execute()
                     tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
                     expiry_date_str = profile_res.data[0].get("premium_expiry_date") if profile_res.data else None
+                    credits_limit = profile_res.data[0].get("credits", 500) if profile_res.data else 500
                     
                     if tier == "subscribed" and expiry_date_str:
                         from datetime import datetime, timezone
@@ -157,7 +161,19 @@ async def convert_statement(
                         if expiry_date_str < now_iso:
                             tier = "registered"
                     
-                    if tier != "subscribed":
+                    if tier == "subscribed":
+                        from datetime import datetime, timezone
+                        today = datetime.now(timezone.utc)
+                        month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", month_start).execute()
+                        pages_this_month = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
+                        
+                        if pages_this_month + page_count > credits_limit:
+                            raise HTTPException(
+                                status_code=403,
+                                detail=f"Monthly limit exceeded. You have {max(0, credits_limit - pages_this_month)} pages left, but this document has {page_count} pages."
+                            )
+                    else:
                         from datetime import datetime, timezone
                         today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
                         conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
@@ -258,6 +274,37 @@ async def convert_batch(
 
             if not user and page_count > 1:
                 return {"index": idx, "filename": file.filename, "success": False, "error": "Anonymous limit 1 page"}
+                
+            if user and supabase:
+                try:
+                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date, credits").eq("id", user["id"]).execute()
+                    tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
+                    expiry_date_str = profile_res.data[0].get("premium_expiry_date") if profile_res.data else None
+                    credits_limit = profile_res.data[0].get("credits", 500) if profile_res.data else 500
+                    
+                    if tier == "subscribed" and expiry_date_str:
+                        from datetime import datetime, timezone
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        if expiry_date_str < now_iso:
+                            tier = "registered"
+                            
+                    if tier == "subscribed":
+                        from datetime import datetime, timezone
+                        today = datetime.now(timezone.utc)
+                        month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", month_start).execute()
+                        pages_this_month = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
+                        if pages_this_month + page_count > credits_limit:
+                            return {"index": idx, "filename": file.filename, "success": False, "error": f"Monthly limit exceeded. Pages left: {max(0, credits_limit - pages_this_month)}"}
+                    else:
+                        from datetime import datetime, timezone
+                        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
+                        pages_today = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
+                        if pages_today + page_count > 5:
+                            return {"index": idx, "filename": file.filename, "success": False, "error": f"Daily limit exceeded. Pages left today: {max(0, 5 - pages_today)}"}
+                except Exception as e:
+                    print(f"Failed to check batch quota: {e}")
 
             raw_txns = []
             try:
