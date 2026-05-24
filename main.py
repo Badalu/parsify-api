@@ -2,19 +2,28 @@ import os
 import shutil
 import tempfile
 import asyncio
+import json
+from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional, List
+
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-# Load variables from the directory where main.py is located
 from pathlib import Path
+
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-from parser import extract_text_from_pdf, parse_pdf_natively, parse_with_gemini, clean_and_format_transactions, generate_excel_file, generate_csv_file
+from parser import (
+    extract_text_from_pdf,
+    parse_pdf_natively,
+    parse_with_gemini,
+    clean_and_format_transactions,
+    generate_excel_file,
+    generate_csv_file,
+)
 from supabase import create_client, Client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -27,9 +36,8 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         print(f"Failed to create Supabase client: {e}")
 
-app = FastAPI(title="StatementConvert Python API", version="1.0.0")
+app = FastAPI(title="StatementConvert Python API", version="2.0.0")
 
-# Set up CORS to allow requests from the Next.js and TanStack frontends
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -53,7 +61,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Helper to verify auth token using Supabase client
+# ─── Constants ────────────────────────────────────────────────────────────────
+ANON_PAGE_LIMIT       = 1    # anonymous: 1 page per request
+REGISTERED_PAGE_LIMIT = 5    # free users: 5 pages per day
+MAX_BATCH_FILES       = 20   # max files per batch request
+MAX_FILE_SIZE_MB      = 25   # max single file size in MB
+
+
+# ─── Auth helper ─────────────────────────────────────────────────────────────
 async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
     if not authorization or not supabase:
         return None
@@ -66,13 +81,75 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
             return {
                 "id": user_res.user.id,
                 "email": user_res.user.email,
-                "role": user_res.user.role
+                "role": user_res.user.role,
             }
     except Exception as e:
         print(f"Token verification error: {e}")
-        raise HTTPException(status_code=401, detail=f"Token verification failed: {str(e)}")
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
     return None
 
+
+# ─── Quota helper — fetches profile + usage in 2 queries (cached per request) ─
+def get_user_quota(user_id: str) -> dict:
+    """
+    Returns a dict with:
+      tier, credits_limit, pages_used (today for registered, month for subscribed),
+      pages_remaining, expired (bool)
+    All in 2 Supabase queries.
+    """
+    if not supabase:
+        return {"tier": "registered", "credits_limit": REGISTERED_PAGE_LIMIT,
+                "pages_used": 0, "pages_remaining": REGISTERED_PAGE_LIMIT, "expired": False}
+
+    # Query 1: Profile
+    profile_res = supabase.table("profiles")\
+        .select("tier, premium_expiry_date, credits")\
+        .eq("id", user_id).execute()
+
+    profile = profile_res.data[0] if profile_res.data else {}
+    tier = profile.get("tier", "registered")
+    expiry_str = profile.get("premium_expiry_date")
+    credits_limit = profile.get("credits", 500) or 500
+
+    # Check expiry
+    expired = False
+    if tier == "subscribed" and expiry_str:
+        if expiry_str < datetime.now(timezone.utc).isoformat():
+            tier = "registered"
+            expired = True
+
+    now = datetime.now(timezone.utc)
+
+    if tier == "subscribed":
+        # Query 2a: pages this month
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        conv_res = supabase.table("conversions")\
+            .select("pages")\
+            .eq("user_id", user_id)\
+            .gte("created_at", month_start).execute()
+        pages_used = sum(c["pages"] for c in (conv_res.data or []))
+        pages_remaining = max(0, credits_limit - pages_used)
+    else:
+        # Query 2b: pages today
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        conv_res = supabase.table("conversions")\
+            .select("pages")\
+            .eq("user_id", user_id)\
+            .gte("created_at", today_start).execute()
+        pages_used = sum(c["pages"] for c in (conv_res.data or []))
+        credits_limit = REGISTERED_PAGE_LIMIT
+        pages_remaining = max(0, REGISTERED_PAGE_LIMIT - pages_used)
+
+    return {
+        "tier": tier,
+        "credits_limit": credits_limit,
+        "pages_used": pages_used,
+        "pages_remaining": pages_remaining,
+        "expired": expired,
+    }
+
+
+# ─── Schemas ──────────────────────────────────────────────────────────────────
 class TransactionSchema(BaseModel):
     date: str
     value_date: Optional[str] = ""
@@ -83,20 +160,26 @@ class TransactionSchema(BaseModel):
     category: Optional[str] = "Other"
     gst: Optional[str] = ""
 
+
 class DownloadRequest(BaseModel):
     transactions: List[TransactionSchema]
     filename: Optional[str] = "statement"
     format: str  # "xlsx" or "csv"
 
+
+# ─── Health ───────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health_check():
     return {
         "status": "healthy",
         "service": "statement-convert-python-backend",
+        "version": "2.0.0",
         "gemini_active": bool(os.getenv("GEMINI_API_KEY")),
-        "supabase_active": bool(supabase is not None)
+        "supabase_active": supabase is not None,
     }
 
+
+# ─── Single Convert ───────────────────────────────────────────────────────────
 @app.post("/api/convert")
 async def convert_statement(
     file: UploadFile = File(...),
@@ -105,300 +188,309 @@ async def convert_statement(
     date_format: Optional[str] = Form("DD/MM/YYYY"),
     categorize: Optional[bool] = Form(True),
     gst: Optional[bool] = Form(True),
-    user: Optional[dict] = Depends(verify_user)
+    user: Optional[dict] = Depends(verify_user),
 ):
-    # Verify file is a PDF
+    # ── Validate file ──
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF statements are supported.")
+        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
-    # Save to a temporary file for parsing
-    temp_dir = tempfile.gettempdir()
-    temp_file_path = os.path.join(temp_dir, f"upload_{file.filename}")
-    
+    temp_path = os.path.join(tempfile.gettempdir(), f"sc_{os.urandom(6).hex()}_{file.filename}")
+
     try:
-        with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
+        # Save to temp (streaming, no full RAM load)
+        with open(temp_path, "wb") as buf:
+            shutil.copyfileobj(file.file, buf)
 
-        # 1. Extract text and check pages
+        # File size check
+        file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        if file_size_mb > MAX_FILE_SIZE_MB:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File too large ({file_size_mb:.1f} MB). Maximum allowed: {MAX_FILE_SIZE_MB} MB."
+            )
+
+        # ── Extract text + page count ──
         try:
-            text, page_count = extract_text_from_pdf(temp_file_path, password=password)
+            text, page_count = extract_text_from_pdf(temp_path, password=password)
         except Exception as e:
-            # Handle password required / wrong password errors
-            err_msg = str(e).lower()
-            if "password" in err_msg or "decrypt" in err_msg:
+            err = str(e).lower()
+            if "password" in err or "decrypt" in err or "encrypted" in err:
                 return JSONResponse(
-                    status_code=401, 
-                    content={"error": "password_required", "message": "This PDF is encrypted. Enter a password to open it."}
+                    status_code=401,
+                    content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."}
                 )
-            raise HTTPException(status_code=500, detail=f"Failed to read PDF file: {e}")
+            raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
 
-        # Basic text content checks
         if not text or len(text.strip()) < 20:
             raise HTTPException(
                 status_code=422,
-                detail="Could not extract text from this PDF. It may be a scanned image or empty. Please upload a text-based PDF statement."
+                detail="Could not extract text from this PDF. It may be a scanned image. Please upload a text-based bank statement."
             )
 
-        # Apply basic quotas
+        # ── Quota check ──
         if not user:
-            # Anonymous check (Max 1 page limit for anonymous)
-            if page_count > 1:
+            # Anonymous — max 1 page
+            if page_count > ANON_PAGE_LIMIT:
                 raise HTTPException(
                     status_code=403,
-                    detail="Anonymous conversions are limited to 1 page. Please sign up for a free account to convert longer statements!"
+                    detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} page. Sign up for free to convert up to 5 pages/day!"
                 )
         else:
-            if supabase:
-                try:
-                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date, credits").eq("id", user["id"]).execute()
-                    tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
-                    expiry_date_str = profile_res.data[0].get("premium_expiry_date") if profile_res.data else None
-                    credits_limit = profile_res.data[0].get("credits", 500) if profile_res.data else 500
-                    
-                    if tier == "subscribed" and expiry_date_str:
-                        from datetime import datetime, timezone
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        if expiry_date_str < now_iso:
-                            tier = "registered"
-                    
-                    if tier == "subscribed":
-                        from datetime import datetime, timezone
-                        today = datetime.now(timezone.utc)
-                        month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", month_start).execute()
-                        pages_this_month = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
-                        
-                        if pages_this_month + page_count > credits_limit:
-                            raise HTTPException(
-                                status_code=403,
-                                detail=f"Monthly limit exceeded. You have {max(0, credits_limit - pages_this_month)} pages left, but this document has {page_count} pages."
-                            )
-                    else:
-                        from datetime import datetime, timezone
-                        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
-                        pages_today = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
-                        
-                        if pages_today + page_count > 5:
-                            raise HTTPException(
-                                status_code=403,
-                                detail=f"Daily limit exceeded. You have {max(0, 5 - pages_today)} pages left today, but this document has {page_count} pages. Upgrade to Pro for more."
-                            )
-                except HTTPException:
-                    raise
-                except Exception as e:
-                    print(f"Failed to check quota: {e}")
-        
-        # 2. Use Gemini AI as primary parser for 100% accuracy across all banks
-        raw_txns = []
-        gemini_error = ""
-        print(f"Using Gemini AI for maximum accuracy: {file.filename}")
-        try:
-            limited_text = text[:600000]
-            raw_txns = parse_with_gemini(limited_text, categorize=categorize, gst=gst)
-            if raw_txns:
-                print(f"Gemini AI extraction succeeded! Extracted {len(raw_txns)} transactions.")
-        except Exception as e:
-            gemini_error = str(e)
-            print(f"Gemini AI failed: {e}. Falling back to native parser...")
+            quota = get_user_quota(user["id"])
 
-        # Fallback to native parser only if Gemini fails (API unavailable, quota, etc.)
+            if quota["expired"]:
+                print(f"User {user['id']} subscription expired — treating as registered")
+
+            if quota["pages_remaining"] <= 0:
+                period = "this month" if quota["tier"] == "subscribed" else "today"
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Quota exceeded. You have used all {quota['credits_limit']} pages {period}. {'Upgrade your plan' if quota['tier'] != 'subscribed' else 'Wait for next month or upgrade plan'} for more."
+                )
+
+            if page_count > quota["pages_remaining"]:
+                period = "this month" if quota["tier"] == "subscribed" else "today"
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Not enough quota. This document has {page_count} pages but you only have {quota['pages_remaining']} pages remaining {period}."
+                )
+
+        # ── Parse with Gemini (primary) → native (fallback) ──
+        raw_txns = []
+        print(f"[Gemini] Parsing: {file.filename} ({page_count} pages)")
+
+        try:
+            raw_txns = parse_with_gemini(text[:600000], categorize=categorize, gst=gst)
+            if raw_txns:
+                print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
+        except Exception as e:
+            print(f"[Gemini] ❌ Failed: {e} — trying native parser")
+
         if not raw_txns:
-            print(f"Gemini unavailable — using native parser as fallback for: {file.filename}")
+            print(f"[Native] Parsing: {file.filename}")
             try:
-                raw_txns = parse_pdf_natively(temp_file_path, password=password)
+                raw_txns = parse_pdf_natively(temp_path, password=password)
                 if raw_txns:
-                    print(f"Native fallback succeeded! Extracted {len(raw_txns)} transactions.")
+                    print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
 
         if not raw_txns:
-            error_msg = "No transaction entries could be detected in this bank statement."
-            if gemini_error:
-                error_msg += f" AI Parser failed with: {gemini_error}."
             raise HTTPException(
                 status_code=422,
-                detail=error_msg
+                detail="No transactions detected in this document. Make sure it is a valid Indian bank statement."
             )
 
-        # 3. Clean and format using pandas
-        cleaned_txns = clean_and_format_transactions(raw_txns, date_format=date_format)
+        cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
 
         return {
             "success": True,
             "filename": file.filename,
             "pages": page_count,
-            "transactions": cleaned_txns,
-            "transactions_count": len(cleaned_txns),
-            "user_id": user["id"] if user else None
+            "transactions": cleaned,
+            "transactions_count": len(cleaned),
+            "user_id": user["id"] if user else None,
         }
 
     finally:
-        # Clean up temporary file
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
+
+# ─── Batch Convert ────────────────────────────────────────────────────────────
 @app.post("/api/convert/batch")
 async def convert_batch(
     files: List[UploadFile] = File(...),
-    passwords: Optional[str] = Form(None), # JSON string of index to password mapping
+    passwords: Optional[str] = Form(None),  # JSON: {"0": "pwd", "1": "pwd2"}
     bank: Optional[str] = Form("auto"),
     date_format: Optional[str] = Form("DD/MM/YYYY"),
     categorize: Optional[bool] = Form(True),
     gst: Optional[bool] = Form(True),
-    user: Optional[dict] = Depends(verify_user)
+    user: Optional[dict] = Depends(verify_user),
 ):
-    import json
-    pwd_map = {}
+    # ── Auth check ──
+    if not user:
+        raise HTTPException(
+            status_code=403,
+            detail="Please log in to use bulk conversion."
+        )
+
+    # ── File count limit ──
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many files. Maximum {MAX_BATCH_FILES} files per batch."
+        )
+
+    # ── Tier check — ONE query ──
+    quota = get_user_quota(user["id"])
+    if quota["tier"] != "subscribed":
+        raise HTTPException(
+            status_code=403,
+            detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Professional (₹1999), or Business (₹3499) plan."
+        )
+
+    if quota["pages_remaining"] <= 0:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Monthly quota exhausted. You have used all {quota['credits_limit']} pages this month."
+        )
+
+    # Parse password map
+    pwd_map: dict = {}
     if passwords:
         try:
             pwd_map = json.loads(passwords)
         except Exception:
             pass
 
-    if not user:
-        raise HTTPException(status_code=403, detail="Anonymous conversions are not allowed for batch processing.")
-    
-    if supabase:
-        profile_res = supabase.table("profiles").select("tier").eq("id", user["id"]).execute()
-        tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
-        if tier != "subscribed":
-            raise HTTPException(
-                status_code=403,
-                detail="Bulk conversion is a premium feature. Please upgrade to a Starter, Professional, or Business plan to use it."
-            )
-
-    async def process_file(idx: int, file: UploadFile):
-        temp_dir = tempfile.gettempdir()
-        temp_file_path = os.path.join(temp_dir, f"batch_upload_{idx}_{file.filename}")
-        
+    # ── Process each file in parallel (true async) ──
+    async def process_one(idx: int, f: UploadFile):
+        temp_path = os.path.join(tempfile.gettempdir(), f"sc_batch_{os.urandom(6).hex()}_{idx}_{f.filename}")
         try:
-            with open(temp_file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+            with open(temp_path, "wb") as buf:
+                shutil.copyfileobj(f.file, buf)
+
+            # File size check
+            file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                return {
+                    "index": idx, "filename": f.filename, "success": False,
+                    "error": f"File too large ({file_size_mb:.1f} MB). Max {MAX_FILE_SIZE_MB} MB allowed."
+                }
 
             pwd = pwd_map.get(str(idx)) or pwd_map.get(idx)
-            
+
             try:
-                text, page_count = extract_text_from_pdf(temp_file_path, password=pwd)
+                text, page_count = extract_text_from_pdf(temp_path, password=pwd)
             except Exception as e:
-                err_msg = str(e).lower()
-                if "password" in err_msg or "decrypt" in err_msg:
-                    return {"index": idx, "filename": file.filename, "success": False, "error": "password_required", "message": "Password required"}
-                return {"index": idx, "filename": file.filename, "success": False, "error": str(e)}
+                err = str(e).lower()
+                if "password" in err or "decrypt" in err:
+                    return {"index": idx, "filename": f.filename, "success": False,
+                            "error": "password_required", "message": "PDF is password protected."}
+                return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
 
             if not text or len(text.strip()) < 20:
-                return {"index": idx, "filename": file.filename, "success": False, "error": "Could not extract text from this PDF."}
+                return {"index": idx, "filename": f.filename, "success": False,
+                        "error": "Could not extract text. May be a scanned image."}
 
-            if not user and page_count > 1:
-                return {"index": idx, "filename": file.filename, "success": False, "error": "Anonymous limit 1 page"}
-                
-            if user and supabase:
-                try:
-                    profile_res = supabase.table("profiles").select("tier, premium_expiry_date, credits").eq("id", user["id"]).execute()
-                    tier = profile_res.data[0].get("tier", "registered") if profile_res.data else "registered"
-                    expiry_date_str = profile_res.data[0].get("premium_expiry_date") if profile_res.data else None
-                    credits_limit = profile_res.data[0].get("credits", 500) if profile_res.data else 500
-                    
-                    if tier == "subscribed" and expiry_date_str:
-                        from datetime import datetime, timezone
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        if expiry_date_str < now_iso:
-                            tier = "registered"
-                            
-                    if tier == "subscribed":
-                        from datetime import datetime, timezone
-                        today = datetime.now(timezone.utc)
-                        month_start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", month_start).execute()
-                        pages_this_month = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
-                        if pages_this_month + page_count > credits_limit:
-                            return {"index": idx, "filename": file.filename, "success": False, "error": f"Monthly limit exceeded. Pages left: {max(0, credits_limit - pages_this_month)}"}
-                    else:
-                        from datetime import datetime, timezone
-                        today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-                        conv_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
-                        pages_today = sum(c["pages"] for c in conv_res.data) if conv_res.data else 0
-                        if pages_today + page_count > 5:
-                            return {"index": idx, "filename": file.filename, "success": False, "error": f"Daily limit exceeded. Pages left today: {max(0, 5 - pages_today)}"}
-                except Exception as e:
-                    print(f"Failed to check batch quota: {e}")
+            # Per-file quota check using cached quota (pages_remaining from single query)
+            if page_count > quota["pages_remaining"]:
+                return {"index": idx, "filename": f.filename, "success": False,
+                        "error": f"Not enough quota for this file ({page_count} pages, {quota['pages_remaining']} remaining)."}
 
+            # Parse
             raw_txns = []
             try:
                 raw_txns = parse_with_gemini(text[:600000], categorize=categorize, gst=gst)
             except Exception as e:
-                print(f"Gemini AI failed for {file.filename}: {e}")
+                print(f"[Gemini] Failed for {f.filename}: {e}")
 
             if not raw_txns:
                 try:
-                    raw_txns = parse_pdf_natively(temp_file_path, password=pwd)
+                    raw_txns = parse_pdf_natively(temp_path, password=pwd)
                 except Exception as e:
-                    return {"index": idx, "filename": file.filename, "success": False, "error": f"All parsers failed: {e}"}
+                    return {"index": idx, "filename": f.filename, "success": False,
+                            "error": f"All parsers failed: {e}"}
 
             if not raw_txns:
-                return {"index": idx, "filename": file.filename, "success": False, "error": "No transactions detected"}
+                return {"index": idx, "filename": f.filename, "success": False,
+                        "error": "No transactions detected."}
 
-            cleaned_txns = clean_and_format_transactions(raw_txns, date_format=date_format)
-
+            cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
             return {
                 "index": idx,
-                "filename": file.filename,
+                "filename": f.filename,
                 "success": True,
                 "pages": page_count,
-                "transactions": cleaned_txns,
-                "transactions_count": len(cleaned_txns)
+                "transactions": cleaned,
+                "transactions_count": len(cleaned),
             }
+
         except Exception as e:
-            return {"index": idx, "filename": file.filename, "success": False, "error": str(e)}
+            return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
         finally:
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
-    tasks = [process_file(idx, f) for idx, f in enumerate(files)]
-    results = await asyncio.gather(*tasks)
-    return {"results": results, "user_id": user["id"] if user else None}
+    # All files processed in parallel — no sequential waits
+    results = await asyncio.gather(*[process_one(i, f) for i, f in enumerate(files)])
 
+    successful = [r for r in results if r.get("success")]
+    total_pages = sum(r.get("pages", 0) for r in successful)
+
+    return {
+        "results": list(results),
+        "user_id": user["id"],
+        "summary": {
+            "total_files": len(files),
+            "successful": len(successful),
+            "failed": len(files) - len(successful),
+            "total_pages": total_pages,
+            "total_transactions": sum(r.get("transactions_count", 0) for r in successful),
+        }
+    }
+
+
+# ─── Quota Status endpoint — frontend calls this for real-time quota display ─
+@app.get("/api/quota")
+async def get_quota(user: Optional[dict] = Depends(verify_user)):
+    if not user:
+        return {
+            "tier": "anonymous",
+            "pages_remaining": ANON_PAGE_LIMIT,
+            "credits_limit": ANON_PAGE_LIMIT,
+            "pages_used": 0,
+        }
+    quota = get_user_quota(user["id"])
+    return {
+        "tier": quota["tier"],
+        "pages_remaining": quota["pages_remaining"],
+        "credits_limit": quota["credits_limit"],
+        "pages_used": quota["pages_used"],
+        "expired": quota["expired"],
+    }
+
+
+# ─── Download ─────────────────────────────────────────────────────────────────
 @app.post("/api/download")
 async def download_file(req: DownloadRequest):
     if not req.transactions:
-        raise HTTPException(status_code=400, detail="Transactions list is empty.")
-        
+        raise HTTPException(status_code=400, detail="No transactions to download.")
+
     temp_dir = tempfile.gettempdir()
     txns_data = [t.model_dump() for t in req.transactions]
-    
-    # Clean filename
-    safe_filename = "".join([c for c in req.filename if c.isalpha() or c.isdigit() or c in ' ._-']).rstrip()
-    safe_filename = os.path.splitext(safe_filename)[0] # remove extension if provided
-    
+
+    safe_name = "".join(
+        c for c in req.filename if c.isalpha() or c.isdigit() or c in " ._-"
+    ).rstrip()
+    safe_name = os.path.splitext(safe_name)[0] or "statement"
+
     if req.format == "xlsx":
-        file_path = os.path.join(temp_dir, f"{safe_filename}.xlsx")
+        file_path = os.path.join(temp_dir, f"{safe_name}.xlsx")
         generate_excel_file(txns_data, file_path)
         media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        filename_out = f"{safe_filename}.xlsx"
+        filename_out = f"{safe_name}.xlsx"
     elif req.format == "csv":
-        file_path = os.path.join(temp_dir, f"{safe_filename}.csv")
+        file_path = os.path.join(temp_dir, f"{safe_name}.csv")
         generate_csv_file(txns_data, file_path)
         media_type = "text/csv"
-        filename_out = f"{safe_filename}.csv"
+        filename_out = f"{safe_name}.csv"
     else:
-        raise HTTPException(status_code=400, detail="Invalid format specified. Must be 'xlsx' or 'csv'.")
-        
-    # Return as file response, deleted after send
+        raise HTTPException(status_code=400, detail="Format must be 'xlsx' or 'csv'.")
+
     class DeleteOnCloseFileResponse(FileResponse):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            
         def close(self) -> None:
             super().close()
             try:
                 if os.path.exists(self.path):
                     os.remove(self.path)
             except Exception as e:
-                print(f"Error removing temp file {self.path}: {e}")
-                
+                print(f"Cleanup error {self.path}: {e}")
+
     return DeleteOnCloseFileResponse(
-        path=file_path, 
-        media_type=media_type, 
+        path=file_path,
+        media_type=media_type,
         filename=filename_out,
-        headers={"Access-Control-Expose-Headers": "Content-Disposition"}
+        headers={"Access-Control-Expose-Headers": "Content-Disposition"},
     )
