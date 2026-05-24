@@ -423,8 +423,14 @@ async def convert_batch(
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
-    # All files processed in parallel — no sequential waits
-    results = await asyncio.gather(*[process_one(i, f) for i, f in enumerate(files)])
+    # Limit concurrency to prevent Out-Of-Memory (OOM) crashes on small servers
+    semaphore = asyncio.Semaphore(2)
+    
+    async def process_with_limit(idx, f):
+        async with semaphore:
+            return await process_one(idx, f)
+
+    results = await asyncio.gather(*[process_with_limit(i, f) for i, f in enumerate(files)])
 
     successful = [r for r in results if r.get("success")]
     total_pages = sum(r.get("pages", 0) for r in successful)
