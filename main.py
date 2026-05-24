@@ -265,23 +265,23 @@ async def convert_statement(
                     detail=f"Not enough quota. This document has {page_count} pages but you only have {quota['pages_remaining']} pages remaining {period}."
                 )
 
-        # ── Parse with Gemini (primary) → native (fallback) ──
+        # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
         raw_txns = []
-        print(f"[Gemini] Parsing: {file.filename} ({page_count} pages)")
+        print(f"[Native] Parsing: {file.filename} ({page_count} pages)")
 
         try:
-            raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
+            raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
             if raw_txns:
-                print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
+                print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
         except Exception as e:
-            print(f"[Gemini] ❌ Failed: {e} — trying native parser")
+            print(f"[Native] ❌ Failed: {e} — trying Gemini parser")
 
         if not raw_txns:
-            print(f"[Native] Parsing: {file.filename}")
+            print(f"[Gemini] Parsing: {file.filename} (fallback)")
             try:
-                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
+                raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
                 if raw_txns:
-                    print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
+                    print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
 
@@ -389,16 +389,16 @@ async def convert_batch(
                 return {"index": idx, "filename": f.filename, "success": False,
                         "error": f"Not enough quota for this file ({page_count} pages, {quota['pages_remaining']} remaining)."}
 
-            # Parse
+            # Parse natively first for extreme speed
             raw_txns = []
             try:
-                raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
+                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
             except Exception as e:
-                print(f"[Gemini] Failed for {f.filename}: {e}")
+                print(f"[Native] Failed for {f.filename}: {e}")
 
             if not raw_txns:
                 try:
-                    raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
+                    raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
                 except Exception as e:
                     return {"index": idx, "filename": f.filename, "success": False,
                             "error": f"All parsers failed: {e}"}
