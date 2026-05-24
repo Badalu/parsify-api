@@ -407,13 +407,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     header_mapping: Dict[str, int] = {}
 
     try:
-        table_extraction_failed = False
         with pdfplumber.open(pdf_path, password=password) as pdf:
             for page in pdf.pages:
-                if table_extraction_failed:
-                    page.flush_cache()
-                    continue
-                
                 tables = page.extract_tables()
                 if not tables:
                     try:
@@ -458,10 +453,20 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                             balance_val = clean_row[balance_idx] if balance_idx is not None and balance_idx < len(clean_row) else ""
                             val_date_val = clean_row[val_date_idx] if val_date_idx is not None and val_date_idx < len(clean_row) else ""
 
-                            if (val_date_val and len(val_date_val) > 11 and not is_valid_date(val_date_val) and re.search(r'[A-Za-z]{2,}', val_date_val)) or \
-                               (debit_val and re.search(r'[A-Za-z]{3,}', debit_val) and "dr" not in debit_val.lower()):
-                                table_extraction_failed = True
-                                break
+                            # Repair column shift caused by missing Value Date column in borderless tables
+                            if val_date_idx is not None and val_date_val and len(val_date_val) > 11 and not is_valid_date(val_date_val) and re.search(r'[A-Za-z]{2,}', val_date_val):
+                                balance_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
+                                credit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
+                                debit_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
+                                desc_val = val_date_val
+                                val_date_val = date_val
+
+                            # If debit is still alphabetic (not an amount), description spilled over
+                            if debit_val and re.search(r'[A-Za-z]{3,}', debit_val) and "dr" not in debit_val.lower():
+                                desc_val += " " + debit_val
+                                debit_val = credit_val
+                                credit_val = balance_val
+                                balance_val = clean_row[balance_idx+1] if balance_idx is not None and balance_idx+1 < len(clean_row) else ""
 
                             txn = {
                                 "date": date_val,
@@ -488,13 +493,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                 if balance_idx is not None and balance_idx < len(clean_row) and clean_row[balance_idx] and not transactions[-1]["balance"]:
                                     transactions[-1]["balance"] = clean_row[balance_idx]
 
-                    if table_extraction_failed:
-                        break
-                
                 page.flush_cache()
-
-        if table_extraction_failed:
-            transactions.clear()
 
         if not transactions:
             print("No transactions found using table extraction. Running line-by-line regex parser fallback...")
