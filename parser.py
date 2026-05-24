@@ -64,6 +64,8 @@ def extract_text_from_pdf(pdf_path: str, password: str = None) -> Tuple[str, int
                     extracted_pages.append(text)
             except Exception:
                 pass
+            finally:
+                page.flush_cache()
 
     return "\n\n--- Page Break ---\n\n".join(extracted_pages), total_pages
 
@@ -475,6 +477,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                     transactions[-1]["credit"] = clean_row[credit_idx]
                                 if balance_idx is not None and balance_idx < len(clean_row) and clean_row[balance_idx] and not transactions[-1]["balance"]:
                                     transactions[-1]["balance"] = clean_row[balance_idx]
+                
+                page.flush_cache()
 
         if not transactions:
             print("No transactions found using table extraction. Running line-by-line regex parser fallback...")
@@ -484,6 +488,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                     page_text = page.extract_text(layout=True)
                     if page_text:
                         full_text_list.append(page_text)
+                    page.flush_cache()
 
                 if full_text_list:
                     raw_text = "\n".join(full_text_list)
