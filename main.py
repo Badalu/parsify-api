@@ -27,7 +27,7 @@ from parser import (
 from supabase import create_client, Client
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_PUBLISHABLE_KEY")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -68,6 +68,8 @@ MAX_BATCH_FILES       = 20   # max files per batch request
 MAX_FILE_SIZE_MB      = 25   # max single file size in MB
 
 
+import httpx
+
 # ─── Auth helper ─────────────────────────────────────────────────────────────
 async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[dict]:
     if not authorization or not supabase:
@@ -82,6 +84,7 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
                 "id": user_res.user.id,
                 "email": user_res.user.email,
                 "role": user_res.user.role,
+                "token": token
             }
     except Exception as e:
         print(f"Token verification error: {e}")
@@ -89,27 +92,34 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
     return None
 
 
-# ─── Quota helper — fetches profile + usage in 2 queries (cached per request) ─
-def get_user_quota(user_id: str) -> dict:
-    """
-    Returns a dict with:
-      tier, credits_limit, pages_used (today for registered, month for subscribed),
-      pages_remaining, expired (bool)
-    All in 2 Supabase queries.
-    """
-    if not supabase:
+# ─── Quota helper — fetches profile + usage via HTTP using user token ────────
+def get_user_quota(user: dict) -> dict:
+    if not SUPABASE_URL:
         return {"tier": "registered", "credits_limit": REGISTERED_PAGE_LIMIT,
                 "pages_used": 0, "pages_remaining": REGISTERED_PAGE_LIMIT, "expired": False}
 
-    # Query 1: Profile
-    profile_res = supabase.table("profiles")\
-        .select("tier, premium_expiry_date, credits")\
-        .eq("id", user_id).execute()
+    headers = {
+        "apikey": os.getenv("SUPABASE_PUBLISHABLE_KEY") or SUPABASE_KEY,
+        "Authorization": f"Bearer {user['token']}",
+    }
 
-    profile = profile_res.data[0] if profile_res.data else {}
-    tier = profile.get("tier", "registered")
-    expiry_str = profile.get("premium_expiry_date")
-    credits_limit = profile.get("credits", 500) or 500
+    tier = "registered"
+    expiry_str = None
+    credits_limit = REGISTERED_PAGE_LIMIT
+
+    try:
+        # Query 1: Profile
+        url = f"{SUPABASE_URL}/rest/v1/profiles?select=tier,premium_expiry_date,credits&id=eq.{user['id']}"
+        res = httpx.get(url, headers=headers)
+        if res.status_code == 200 and res.json():
+            profile = res.json()[0]
+            tier = profile.get("tier", "registered")
+            expiry_str = profile.get("premium_expiry_date")
+            credits_limit = profile.get("credits") or REGISTERED_PAGE_LIMIT
+            if tier == "subscribed" and not profile.get("credits"):
+                credits_limit = 500
+    except Exception as e:
+        print(f"Error fetching profile: {e}")
 
     # Check expiry
     expired = False
@@ -117,28 +127,28 @@ def get_user_quota(user_id: str) -> dict:
         if expiry_str < datetime.now(timezone.utc).isoformat():
             tier = "registered"
             expired = True
+            credits_limit = REGISTERED_PAGE_LIMIT
 
     now = datetime.now(timezone.utc)
+    pages_used = 0
 
-    if tier == "subscribed":
-        # Query 2a: pages this month
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-        conv_res = supabase.table("conversions")\
-            .select("pages")\
-            .eq("user_id", user_id)\
-            .gte("created_at", month_start).execute()
-        pages_used = sum(c["pages"] for c in (conv_res.data or []))
-        pages_remaining = max(0, credits_limit - pages_used)
-    else:
-        # Query 2b: pages today
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        conv_res = supabase.table("conversions")\
-            .select("pages")\
-            .eq("user_id", user_id)\
-            .gte("created_at", today_start).execute()
-        pages_used = sum(c["pages"] for c in (conv_res.data or []))
-        credits_limit = REGISTERED_PAGE_LIMIT
-        pages_remaining = max(0, REGISTERED_PAGE_LIMIT - pages_used)
+    try:
+        if tier == "subscribed":
+            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{month_start}"
+            c_res = httpx.get(c_url, headers=headers)
+            if c_res.status_code == 200:
+                pages_used = sum(c.get("pages", 0) for c in c_res.json())
+        else:
+            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+            c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{today_start}"
+            c_res = httpx.get(c_url, headers=headers)
+            if c_res.status_code == 200:
+                pages_used = sum(c.get("pages", 0) for c in c_res.json())
+    except Exception as e:
+        print(f"Error fetching conversions: {e}")
+
+    pages_remaining = max(0, credits_limit - pages_used)
 
     return {
         "tier": tier,
@@ -236,7 +246,7 @@ async def convert_statement(
                     detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} page. Sign up for free to convert up to 5 pages/day!"
                 )
         else:
-            quota = get_user_quota(user["id"])
+            quota = get_user_quota(user)
 
             if quota["expired"]:
                 print(f"User {user['id']} subscription expired — treating as registered")
@@ -323,7 +333,7 @@ async def convert_batch(
         )
 
     # ── Tier check — ONE query ──
-    quota = get_user_quota(user["id"])
+    quota = get_user_quota(user)
     if quota["tier"] != "subscribed":
         raise HTTPException(
             status_code=403,
@@ -442,7 +452,7 @@ async def get_quota(user: Optional[dict] = Depends(verify_user)):
             "credits_limit": ANON_PAGE_LIMIT,
             "pages_used": 0,
         }
-    quota = get_user_quota(user["id"])
+    quota = get_user_quota(user)
     return {
         "tier": quota["tier"],
         "pages_remaining": quota["pages_remaining"],
