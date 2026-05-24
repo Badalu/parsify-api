@@ -221,7 +221,7 @@ async def convert_statement(
 
         # ── Extract text + page count ──
         try:
-            text, page_count = extract_text_from_pdf(temp_path, password=password)
+            text, page_count = await asyncio.to_thread(extract_text_from_pdf, temp_path, password)
         except Exception as e:
             err = str(e).lower()
             if "password" in err or "decrypt" in err or "encrypted" in err:
@@ -246,7 +246,7 @@ async def convert_statement(
                     detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} page. Sign up for free to convert up to 5 pages/day!"
                 )
         else:
-            quota = get_user_quota(user)
+            quota = await asyncio.to_thread(get_user_quota, user)
 
             if quota["expired"]:
                 print(f"User {user['id']} subscription expired — treating as registered")
@@ -270,7 +270,7 @@ async def convert_statement(
         print(f"[Gemini] Parsing: {file.filename} ({page_count} pages)")
 
         try:
-            raw_txns = parse_with_gemini(text[:600000], categorize=categorize, gst=gst)
+            raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
             if raw_txns:
                 print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
         except Exception as e:
@@ -279,7 +279,7 @@ async def convert_statement(
         if not raw_txns:
             print(f"[Native] Parsing: {file.filename}")
             try:
-                raw_txns = parse_pdf_natively(temp_path, password=password)
+                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
                 if raw_txns:
                     print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
             except Exception as e:
@@ -372,7 +372,7 @@ async def convert_batch(
             pwd = pwd_map.get(str(idx)) or pwd_map.get(idx)
 
             try:
-                text, page_count = extract_text_from_pdf(temp_path, password=pwd)
+                text, page_count = await asyncio.to_thread(extract_text_from_pdf, temp_path, pwd)
             except Exception as e:
                 err = str(e).lower()
                 if "password" in err or "decrypt" in err:
@@ -392,13 +392,13 @@ async def convert_batch(
             # Parse
             raw_txns = []
             try:
-                raw_txns = parse_with_gemini(text[:600000], categorize=categorize, gst=gst)
+                raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
             except Exception as e:
                 print(f"[Gemini] Failed for {f.filename}: {e}")
 
             if not raw_txns:
                 try:
-                    raw_txns = parse_pdf_natively(temp_path, password=pwd)
+                    raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
                 except Exception as e:
                     return {"index": idx, "filename": f.filename, "success": False,
                             "error": f"All parsers failed: {e}"}
