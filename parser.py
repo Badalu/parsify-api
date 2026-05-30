@@ -44,21 +44,35 @@ class TransactionItem(BaseModel):
 class TransactionsList(BaseModel):
     transactions: List[TransactionItem]
 
-def extract_text_from_pdf(pdf_path: str, password: str = None) -> Tuple[str, int]:
+def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
     """
-    Extract text from PDF using pdfplumber, with optional password unlocking.
-    Tries table extraction first for accurate column alignment, falls back to
-    layout-aware text extraction.
-    Returns (extracted_text, total_pages).
+    Swiftly checks page count and whether the document is text-based by reading just the first two pages.
+    Returns (total_pages, is_text_based).
+    """
+    try:
+        with pdfplumber.open(pdf_path, password=password) as pdf:
+            total_pages = len(pdf.pages)
+            if total_pages == 0:
+                return 0, False
+            
+            # Check up to 2 pages to verify it's not just a scanned image
+            for i in range(min(2, total_pages)):
+                text = pdf.pages[i].extract_text()
+                if text and len(text.strip()) > 20:
+                    return total_pages, True
+            return total_pages, False
+    except Exception as e:
+        raise e
+
+def extract_full_text(pdf_path: str, password: str = None) -> str:
+    """
+    Extracts full layout-aware text from all pages sequentially.
+    This is an expensive operation and should only be called as a fallback.
     """
     extracted_pages = []
-    total_pages = 0
-
     with pdfplumber.open(pdf_path, password=password) as pdf:
-        total_pages = len(pdf.pages)
         for page in pdf.pages:
             try:
-                # Fast layout-aware extraction for Gemini AI
                 text = page.extract_text(layout=True)
                 if text:
                     extracted_pages.append(text)
@@ -67,7 +81,7 @@ def extract_text_from_pdf(pdf_path: str, password: str = None) -> Tuple[str, int
             finally:
                 page.flush_cache()
 
-    return "\n\n--- Page Break ---\n\n".join(extracted_pages), total_pages
+    return "\n\n--- Page Break ---\n\n".join(extracted_pages)
 
 
 # ── Native Rule-Based Parser Helpers ──────────────────────────────────────────
@@ -494,20 +508,6 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                     transactions[-1]["balance"] = clean_row[balance_idx]
 
                 page.flush_cache()
-
-        if not transactions:
-            print("No transactions found using table extraction. Running line-by-line regex parser fallback...")
-            with pdfplumber.open(pdf_path, password=password) as pdf:
-                full_text_list = []
-                for page in pdf.pages:
-                    page_text = page.extract_text(layout=True)
-                    if page_text:
-                        full_text_list.append(page_text)
-                    page.flush_cache()
-
-                if full_text_list:
-                    raw_text = "\n".join(full_text_list)
-                    transactions = parse_line_by_line(raw_text)
 
     except Exception as e:
         print(f"Error during native PDF parsing: {e}")

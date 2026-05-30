@@ -17,7 +17,8 @@ env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
 from parser import (
-    extract_text_from_pdf,
+    check_pdf_basic,
+    extract_full_text,
     parse_pdf_natively,
     parse_with_gemini,
     clean_and_format_transactions,
@@ -219,9 +220,9 @@ async def convert_statement(
                 detail=f"File too large ({file_size_mb:.1f} MB). Maximum allowed: {MAX_FILE_SIZE_MB} MB."
             )
 
-        # ── Extract text + page count ──
+        # ── Extract page count & basic text check ──
         try:
-            text, page_count = await asyncio.to_thread(extract_text_from_pdf, temp_path, password)
+            page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, password)
         except Exception as e:
             err = str(e).lower()
             if "password" in err or "decrypt" in err or "encrypted" in err:
@@ -231,7 +232,7 @@ async def convert_statement(
                 )
             raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
 
-        if not text or len(text.strip()) < 20:
+        if not is_text_based or page_count == 0:
             raise HTTPException(
                 status_code=422,
                 detail="Could not extract text from this PDF. It may be a scanned image. Please upload a text-based bank statement."
@@ -279,6 +280,7 @@ async def convert_statement(
         if not raw_txns:
             print(f"[Gemini] Parsing: {file.filename} (fallback)")
             try:
+                text = await asyncio.to_thread(extract_full_text, temp_path, password)
                 raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
                 if raw_txns:
                     print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
@@ -372,7 +374,7 @@ async def convert_batch(
             pwd = pwd_map.get(str(idx)) or pwd_map.get(idx)
 
             try:
-                text, page_count = await asyncio.to_thread(extract_text_from_pdf, temp_path, pwd)
+                page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, pwd)
             except Exception as e:
                 err = str(e).lower()
                 if "password" in err or "decrypt" in err:
@@ -380,7 +382,7 @@ async def convert_batch(
                             "error": "password_required", "message": "PDF is password protected."}
                 return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
 
-            if not text or len(text.strip()) < 20:
+            if not is_text_based or page_count == 0:
                 return {"index": idx, "filename": f.filename, "success": False,
                         "error": "Could not extract text. May be a scanned image."}
 
@@ -398,6 +400,7 @@ async def convert_batch(
 
             if not raw_txns:
                 try:
+                    text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
                     raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
                 except Exception as e:
                     return {"index": idx, "filename": f.filename, "success": False,
