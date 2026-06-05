@@ -9,3 +9,4 @@ google-generativeai
 supabase
 python-dotenv
 pydantic
+httpx
