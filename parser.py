@@ -24,11 +24,12 @@ else:
 # Initialize Gemini SDK
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Increased chunk size — Gemini 2.5 Flash handles 1M tokens; 120K chars ~= 30K tokens safely
-GEMINI_CHUNK_SIZE = 120_000
+# Increased parallelization — Gemini 2.5 Flash is extremely fast. 
+# We split into smaller chunks (approx 2-3 pages) to force parallel execution.
+GEMINI_CHUNK_SIZE = 10_000
 
 # Max parallel workers for concurrent Gemini chunk calls
-GEMINI_MAX_WORKERS = 4
+GEMINI_MAX_WORKERS = 10
 
 # Define schemas for structured Gemini output
 class TransactionItem(BaseModel):
