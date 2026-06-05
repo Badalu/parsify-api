@@ -178,6 +178,11 @@ class DownloadRequest(BaseModel):
     format: str  # "xlsx" or "csv"
 
 
+# ─── Root ───────────────────────────────────────────────────────────────────
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to StatementConvert Python API", "docs": "/docs"}
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 @app.get("/api/health")
 def health_check():
