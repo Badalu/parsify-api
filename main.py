@@ -63,8 +63,8 @@ app.add_middleware(
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-ANON_PAGE_LIMIT       = 1    # anonymous: 1 page per request
-REGISTERED_PAGE_LIMIT = 5    # free users: 5 pages per day
+ANON_PAGE_LIMIT       = 5    # anonymous: 5 pages per request
+REGISTERED_PAGE_LIMIT = 10   # free users: 10 pages per day
 MAX_BATCH_FILES       = 20   # max files per batch request
 MAX_FILE_SIZE_MB      = 25   # max single file size in MB
 
@@ -249,7 +249,7 @@ async def convert_statement(
             if page_count > ANON_PAGE_LIMIT:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} page. Sign up for free to convert up to 5 pages/day!"
+                    detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} pages. Sign up for free to convert up to {REGISTERED_PAGE_LIMIT} pages/day!"
                 )
         else:
             quota = await asyncio.to_thread(get_user_quota, user)
