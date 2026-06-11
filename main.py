@@ -63,10 +63,13 @@ app.add_middleware(
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-ANON_PAGE_LIMIT       = 0    # anonymous disabled
-REGISTERED_PAGE_LIMIT = 50   # free users: 50 pages per month
-MAX_BATCH_FILES       = 20   # max files per batch request
-MAX_FILE_SIZE_MB      = 25   # max single file size in MB
+ANON_PAGE_LIMIT            = 0    # anonymous disabled
+REGISTERED_PAGE_LIMIT      = 50   # free users: 50 pages per month (page-based)
+STARTER_STMT_LIMIT         = 40   # starter plan: 40 statements/month
+GROWTH_STMT_LIMIT          = 120  # growth plan: 120 statements/month
+PRO_STMT_LIMIT             = 400  # pro plan: 400 statements/month
+MAX_BATCH_FILES            = 20   # max files per batch request
+MAX_FILE_SIZE_MB           = 25   # max single file size in MB
 
 
 import httpx
@@ -94,10 +97,24 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
 
 
 # ─── Quota helper — fetches profile + usage via HTTP using user token ────────
+#
+# Quota model:
+#   Free (registered): page-based  — 50 pages/month, resets 1st of month
+#   Paid (subscribed): statement-based — 1 statement consumed per conversion
+#                      regardless of page count (40/120/400 per month)
 def get_user_quota(user: dict) -> dict:
     if not SUPABASE_URL:
-        return {"tier": "registered", "credits_limit": REGISTERED_PAGE_LIMIT,
-                "pages_used": 0, "pages_remaining": REGISTERED_PAGE_LIMIT, "expired": False}
+        return {
+            "tier": "registered",
+            "credits_limit": REGISTERED_PAGE_LIMIT,
+            "units_used": 0,
+            "units_remaining": REGISTERED_PAGE_LIMIT,
+            "is_statement_based": False,
+            "expired": False,
+            # Legacy aliases kept for backward-compat:
+            "pages_used": 0,
+            "pages_remaining": REGISTERED_PAGE_LIMIT,
+        }
 
     headers = {
         "apikey": os.getenv("SUPABASE_PUBLISHABLE_KEY") or SUPABASE_KEY,
@@ -106,7 +123,7 @@ def get_user_quota(user: dict) -> dict:
 
     tier = "registered"
     expiry_str = None
-    credits_limit = REGISTERED_PAGE_LIMIT
+    credits_limit = REGISTERED_PAGE_LIMIT  # will be overridden for subscribed
 
     try:
         # Query 1: Profile
@@ -116,9 +133,12 @@ def get_user_quota(user: dict) -> dict:
             profile = res.json()[0]
             tier = profile.get("tier", "registered")
             expiry_str = profile.get("premium_expiry_date")
-            credits_limit = profile.get("credits") or REGISTERED_PAGE_LIMIT
-            if tier == "subscribed" and not profile.get("credits"):
-                credits_limit = 500
+            # credits column stores statement-limit for paid, page-limit for free
+            raw_credits = profile.get("credits")
+            if tier == "subscribed":
+                credits_limit = raw_credits if raw_credits else STARTER_STMT_LIMIT
+            else:
+                credits_limit = REGISTERED_PAGE_LIMIT
     except Exception as e:
         print(f"Error fetching profile: {e}")
 
@@ -132,25 +152,46 @@ def get_user_quota(user: dict) -> dict:
 
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(IST)
-    pages_used = 0
+    month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    # ── Usage counting depends on tier ──
+    is_statement_based = (tier == "subscribed")
+    units_used = 0
 
     try:
-        month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-        c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{month_start}"
-        c_res = httpx.get(c_url, headers=headers)
-        if c_res.status_code == 200:
-            pages_used = sum(c.get("pages", 0) for c in c_res.json())
+        if is_statement_based:
+            # Count number of conversions (1 statement = 1 unit)
+            c_url = (
+                f"{SUPABASE_URL}/rest/v1/conversions?select=id"
+                f"&user_id=eq.{user['id']}&created_at=gte.{month_start}"
+            )
+            c_res = httpx.get(c_url, headers=headers)
+            if c_res.status_code == 200:
+                units_used = len(c_res.json())
+        else:
+            # Free user: count pages consumed
+            c_url = (
+                f"{SUPABASE_URL}/rest/v1/conversions?select=pages"
+                f"&user_id=eq.{user['id']}&created_at=gte.{month_start}"
+            )
+            c_res = httpx.get(c_url, headers=headers)
+            if c_res.status_code == 200:
+                units_used = sum(c.get("pages", 0) for c in c_res.json())
     except Exception as e:
         print(f"Error fetching conversions: {e}")
 
-    pages_remaining = max(0, credits_limit - pages_used)
+    units_remaining = max(0, credits_limit - units_used)
 
     return {
         "tier": tier,
         "credits_limit": credits_limit,
-        "pages_used": pages_used,
-        "pages_remaining": pages_remaining,
+        "units_used": units_used,
+        "units_remaining": units_remaining,
+        "is_statement_based": is_statement_based,
         "expired": expired,
+        # Legacy aliases (pages) for backward compat with frontend
+        "pages_used": units_used,
+        "pages_remaining": units_remaining,
     }
 
 
@@ -249,19 +290,17 @@ async def convert_statement(
             if quota["expired"]:
                 print(f"User {user['id']} subscription expired — treating as registered")
 
-            if quota["pages_remaining"] <= 0:
-                period = "this month"
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Quota exceeded. You have used all {quota['credits_limit']} pages {period}. {'Upgrade your plan' if quota['tier'] != 'subscribed' else 'Wait for next month or upgrade plan'} for more."
-                )
-
-            if page_count > quota["pages_remaining"]:
-                period = "this month"
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Not enough quota. This document has {page_count} pages but you only have {quota['pages_remaining']} pages remaining {period}."
-                )
+            if quota["units_remaining"] <= 0:
+                if quota["is_statement_based"]:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Monthly statement limit reached. You have used all {quota['credits_limit']} statements this month. Wait for next month or upgrade your plan."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Free page quota exhausted. You have used all 50 pages this month. Register/upgrade to get more conversions."
+                    )
 
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
         raw_txns = []
@@ -339,10 +378,11 @@ async def convert_batch(
             detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Growth (₹1999), or Pro (₹3400) plan."
         )
 
-    if quota["pages_remaining"] <= 0:
+    if quota["units_remaining"] <= 0:
+        unit_label = "statements" if quota["is_statement_based"] else "pages"
         raise HTTPException(
             status_code=403,
-            detail=f"Monthly quota exhausted. You have used all {quota['credits_limit']} pages this month."
+            detail=f"Monthly quota exhausted. You have used all {quota['credits_limit']} {unit_label} this month."
         )
 
     # Parse password map
@@ -383,10 +423,12 @@ async def convert_batch(
                 return {"index": idx, "filename": f.filename, "success": False,
                         "error": "Could not extract text. May be a scanned image."}
 
-            # Per-file quota check using cached quota (pages_remaining from single query)
-            if page_count > quota["pages_remaining"]:
+            # Per-file quota check: paid plans count statements, not pages
+            # (quota was fetched once before the batch loop)
+            if quota["units_remaining"] <= 0:
+                unit_label = "statements" if quota["is_statement_based"] else "pages"
                 return {"index": idx, "filename": f.filename, "success": False,
-                        "error": f"Not enough quota for this file ({page_count} pages, {quota['pages_remaining']} remaining)."}
+                        "error": f"Monthly limit reached. No {unit_label} remaining this month."}
 
             # Parse natively first for extreme speed
             raw_txns = []
@@ -459,10 +501,14 @@ async def get_quota(user: Optional[dict] = Depends(verify_user)):
     quota = get_user_quota(user)
     return {
         "tier": quota["tier"],
-        "pages_remaining": quota["pages_remaining"],
         "credits_limit": quota["credits_limit"],
-        "pages_used": quota["pages_used"],
+        "units_used": quota["units_used"],
+        "units_remaining": quota["units_remaining"],
+        "is_statement_based": quota["is_statement_based"],
         "expired": quota["expired"],
+        # Legacy aliases
+        "pages_remaining": quota["pages_remaining"],
+        "pages_used": quota["pages_used"],
     }
 
 
