@@ -3,7 +3,7 @@ import shutil
 import tempfile
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -63,8 +63,8 @@ app.add_middleware(
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-ANON_PAGE_LIMIT       = 5    # anonymous: 5 pages per request
-REGISTERED_PAGE_LIMIT = 10   # free users: 10 pages per day
+ANON_PAGE_LIMIT       = 0    # anonymous disabled
+REGISTERED_PAGE_LIMIT = 50   # free users: 50 pages per month
 MAX_BATCH_FILES       = 20   # max files per batch request
 MAX_FILE_SIZE_MB      = 25   # max single file size in MB
 
@@ -130,22 +130,16 @@ def get_user_quota(user: dict) -> dict:
             expired = True
             credits_limit = REGISTERED_PAGE_LIMIT
 
-    now = datetime.now(timezone.utc)
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST)
     pages_used = 0
 
     try:
-        if tier == "subscribed":
-            month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-            c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{month_start}"
-            c_res = httpx.get(c_url, headers=headers)
-            if c_res.status_code == 200:
-                pages_used = sum(c.get("pages", 0) for c in c_res.json())
-        else:
-            today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-            c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{today_start}"
-            c_res = httpx.get(c_url, headers=headers)
-            if c_res.status_code == 200:
-                pages_used = sum(c.get("pages", 0) for c in c_res.json())
+        month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        c_url = f"{SUPABASE_URL}/rest/v1/conversions?select=pages&user_id=eq.{user['id']}&created_at=gte.{month_start}"
+        c_res = httpx.get(c_url, headers=headers)
+        if c_res.status_code == 200:
+            pages_used = sum(c.get("pages", 0) for c in c_res.json())
     except Exception as e:
         print(f"Error fetching conversions: {e}")
 
@@ -245,12 +239,10 @@ async def convert_statement(
 
         # ── Quota check ──
         if not user:
-            # Anonymous — max 1 page
-            if page_count > ANON_PAGE_LIMIT:
-                raise HTTPException(
-                    status_code=403,
-                    detail=f"Anonymous users can only convert {ANON_PAGE_LIMIT} pages. Sign up for free to convert up to {REGISTERED_PAGE_LIMIT} pages/day!"
-                )
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Please sign up or sign in to convert bank statements."
+            )
         else:
             quota = await asyncio.to_thread(get_user_quota, user)
 
@@ -258,14 +250,14 @@ async def convert_statement(
                 print(f"User {user['id']} subscription expired — treating as registered")
 
             if quota["pages_remaining"] <= 0:
-                period = "this month" if quota["tier"] == "subscribed" else "today"
+                period = "this month"
                 raise HTTPException(
                     status_code=403,
                     detail=f"Quota exceeded. You have used all {quota['credits_limit']} pages {period}. {'Upgrade your plan' if quota['tier'] != 'subscribed' else 'Wait for next month or upgrade plan'} for more."
                 )
 
             if page_count > quota["pages_remaining"]:
-                period = "this month" if quota["tier"] == "subscribed" else "today"
+                period = "this month"
                 raise HTTPException(
                     status_code=403,
                     detail=f"Not enough quota. This document has {page_count} pages but you only have {quota['pages_remaining']} pages remaining {period}."
@@ -328,8 +320,8 @@ async def convert_batch(
     # ── Auth check ──
     if not user:
         raise HTTPException(
-            status_code=403,
-            detail="Please log in to use bulk conversion."
+            status_code=401,
+            detail="Authentication required. Please sign up or sign in to use bulk conversion."
         )
 
     # ── File count limit ──
@@ -344,7 +336,7 @@ async def convert_batch(
     if quota["tier"] != "subscribed":
         raise HTTPException(
             status_code=403,
-            detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Professional (₹1999), or Business (₹3499) plan."
+            detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Growth (₹1999), or Pro (₹3400) plan."
         )
 
     if quota["pages_remaining"] <= 0:
@@ -460,12 +452,10 @@ async def convert_batch(
 @app.get("/api/quota")
 async def get_quota(user: Optional[dict] = Depends(verify_user)):
     if not user:
-        return {
-            "tier": "anonymous",
-            "pages_remaining": ANON_PAGE_LIMIT,
-            "credits_limit": ANON_PAGE_LIMIT,
-            "pages_used": 0,
-        }
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Please sign up or sign in to view quota."
+        )
     quota = get_user_quota(user)
     return {
         "tier": quota["tier"],
