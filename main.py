@@ -63,6 +63,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/api/test-timeout")
+async def test_timeout():
+    import asyncio
+    await asyncio.sleep(15)
+    return {"status": "success", "message": "Waited 15 seconds successfully"}
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
     import traceback
