@@ -679,7 +679,7 @@ def _call_gemini_chunk(
         f"BANK STATEMENT TEXT:\n{'='*60}\n{text_chunk}\n{'='*60}"
     )
 
-    max_retries = 3
+    max_retries = 5
     for attempt in range(max_retries):
         try:
             if GENAI_NEW_SDK:
@@ -725,9 +725,9 @@ def _call_gemini_chunk(
             err_msg = str(e).lower()
             if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "limit" in err_msg:
                 print(f"Rate limit / Quota hit on chunk {chunk_num}. Waiting longer before retry...")
-                time.sleep(5) # Force a longer sleep for rate limits
+                time.sleep(8) # Force a longer sleep for rate limits
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
+                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s, 8s
             else:
                 raise
     return []
@@ -803,32 +803,24 @@ def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> L
             chunks.append((chunk_num, current_chunk))
 
         total_chunks = len(chunks)
-        print(f"  Processing {total_chunks} chunks in parallel (max {GEMINI_MAX_WORKERS} workers)...")
+        print(f"  Processing {total_chunks} chunks sequentially to respect rate limits...")
 
-        # Execute all chunks in parallel
         chunk_results: Dict[int, List[Dict[str, Any]]] = {}
 
-        with ThreadPoolExecutor(max_workers=min(GEMINI_MAX_WORKERS, total_chunks)) as executor:
-            future_to_chunk = {
-                executor.submit(
-                    _call_gemini_chunk,
-                    model_or_client,
-                    system_prompt,
-                    chunk_text,
-                    c_num,
-                    f"(Chunk {c_num} of {total_chunks} — process only the transactions in this section)"
-                ): c_num
-                for c_num, chunk_text in chunks
-            }
-
-            for future in as_completed(future_to_chunk):
-                c_num = future_to_chunk[future]
-                try:
-                    txns = future.result()
-                    chunk_results[c_num] = txns
-                except Exception as e:
-                    print(f"  Chunk {c_num} failed permanently: {e}")
-                    chunk_results[c_num] = []
+        for c_num, chunk_text in chunks:
+            if c_num > 1:
+                # 2-second safety delay between chunks to stay under 15 RPM
+                time.sleep(2.0)
+            
+            print(f"  Processing chunk {c_num} of {total_chunks}...")
+            txns = _call_gemini_chunk(
+                model_or_client,
+                system_prompt,
+                chunk_text,
+                c_num,
+                f"(Chunk {c_num} of {total_chunks} — process only the transactions in this section)"
+            )
+            chunk_results[c_num] = txns
 
         # Merge in order
         for c_num in sorted(chunk_results.keys()):

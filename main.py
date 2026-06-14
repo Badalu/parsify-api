@@ -391,6 +391,9 @@ async def convert_statement(
                 if raw_txns:
                     print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
             except Exception as e:
+                err_msg = str(e).lower()
+                if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
+                    raise HTTPException(status_code=429, detail="Rate limit reached. Try again shortly.")
                 raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
 
         if not raw_txns:
@@ -533,6 +536,10 @@ async def convert_batch(
                     text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
                     raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
                 except Exception as e:
+                    err_msg = str(e).lower()
+                    if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
+                        return {"index": idx, "filename": f.filename, "success": False,
+                                "error": "Rate limit reached. Try again shortly."}
                     return {"index": idx, "filename": f.filename, "success": False,
                             "error": f"All parsers failed: {e}"}
 
