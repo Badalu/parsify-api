@@ -100,9 +100,11 @@ def extract_full_text(pdf_path: str, password: str = None) -> str:
 # ── Native Rule-Based Parser Helpers ──────────────────────────────────────────
 
 DATE_PATTERNS = [
-    re.compile(r'^\s*\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\s*$'),          # 12/05/2023
-    re.compile(r'^\s*\d{1,2}[-/\.][A-Za-z]{3,4}[-/\.]\d{2,4}\s*$'),    # 12-May-2023
-    re.compile(r'^\s*\d{1,2}\s+[A-Za-z]{3,4}\s+\d{2,4}\s*$'),           # 12 May 2023
+    re.compile(r'^\s*\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\s*$'),          # 12/05/2023, 12-05-23
+    re.compile(r'^\s*\d{1,2}[-/\.][A-Za-z]{3,4}[-/\.]\d{2,4}\s*$'),    # 12-May-2023, 12-May-23
+    re.compile(r'^\s*\d{1,2}\s+[A-Za-z]{3,4}\s+\d{2,4}\s*$'),           # 12 May 2023, 12 May 23
+    re.compile(r'^\s*[A-Za-z]{3,4}\s+\d{1,2},?\s+\d{2,4}\s*$'),        # May 12, 2023, May 12 23
+    re.compile(r'^\s*\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}\s*$'),            # 2023-05-12
 ]
 
 def is_valid_date(val: str) -> bool:

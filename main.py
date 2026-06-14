@@ -21,6 +21,7 @@ from parser import (
     extract_full_text,
     parse_pdf_natively,
     parse_with_gemini,
+    parse_line_by_line,
     clean_and_format_transactions,
     generate_excel_file,
     generate_csv_file,
@@ -384,17 +385,14 @@ async def convert_statement(
             print(f"[Native] ❌ Failed: {e} — trying Gemini parser")
 
         if not raw_txns:
-            print(f"[Gemini] Parsing: {file.filename} (fallback)")
+            print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
             try:
                 text = await asyncio.to_thread(extract_full_text, temp_path, password)
-                raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
+                raw_txns = parse_line_by_line(text)
                 if raw_txns:
-                    print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted")
+                    print(f"[Native] ✅ {len(raw_txns)} transactions extracted via regex line fallback")
             except Exception as e:
-                err_msg = str(e).lower()
-                if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
-                    raise HTTPException(status_code=429, detail=f"Rate limit reached: {e}")
-                raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
+                raise HTTPException(status_code=500, detail=f"Native line parser failed: {e}")
 
         if not raw_txns:
             raise HTTPException(
@@ -534,14 +532,10 @@ async def convert_batch(
             if not raw_txns:
                 try:
                     text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
-                    raw_txns = await asyncio.to_thread(parse_with_gemini, text[:600000], categorize, gst)
+                    raw_txns = parse_line_by_line(text)
                 except Exception as e:
-                    err_msg = str(e).lower()
-                    if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
-                        return {"index": idx, "filename": f.filename, "success": False,
-                                "error": f"Rate limit reached: {e}"}
                     return {"index": idx, "filename": f.filename, "success": False,
-                            "error": f"All parsers failed: {e}"}
+                            "error": f"Native line parser failed: {e}"}
 
             if not raw_txns:
                 return {"index": idx, "filename": f.filename, "success": False,
