@@ -393,7 +393,7 @@ async def convert_statement(
             except Exception as e:
                 err_msg = str(e).lower()
                 if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
-                    raise HTTPException(status_code=429, detail="Rate limit reached. Try again shortly.")
+                    raise HTTPException(status_code=429, detail=f"Rate limit reached: {e}")
                 raise HTTPException(status_code=500, detail=f"All parsers failed: {e}")
 
         if not raw_txns:
@@ -539,7 +539,7 @@ async def convert_batch(
                     err_msg = str(e).lower()
                     if any(k in err_msg for k in ["429", "quota", "resource_exhausted", "limit"]):
                         return {"index": idx, "filename": f.filename, "success": False,
-                                "error": "Rate limit reached. Try again shortly."}
+                                "error": f"Rate limit reached: {e}"}
                     return {"index": idx, "filename": f.filename, "success": False,
                             "error": f"All parsers failed: {e}"}
 
