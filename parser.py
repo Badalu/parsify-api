@@ -30,7 +30,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_CHUNK_SIZE = 150_000
 
 # Max parallel workers for concurrent Gemini chunk calls
-GEMINI_MAX_WORKERS = 10
+GEMINI_MAX_WORKERS = 2
 
 # Define schemas for structured Gemini output
 class TransactionItem(BaseModel):
@@ -724,8 +724,8 @@ def _call_gemini_chunk(
             print(f"  Chunk {chunk_num} attempt {attempt+1} failed: {e}")
             err_msg = str(e).lower()
             if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "limit" in err_msg:
-                print(f"Rate limit / Quota hit on chunk {chunk_num}. Failsafe aborting retries.")
-                raise e
+                print(f"Rate limit / Quota hit on chunk {chunk_num}. Waiting longer before retry...")
+                time.sleep(5) # Force a longer sleep for rate limits
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
             else:
