@@ -27,7 +27,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Increased parallelization — Gemini 2.5 Flash is extremely fast. 
 # We split into smaller chunks (approx 2-3 pages) to force parallel execution.
-GEMINI_CHUNK_SIZE = 10_000
+GEMINI_CHUNK_SIZE = 150_000
 
 # Max parallel workers for concurrent Gemini chunk calls
 GEMINI_MAX_WORKERS = 10
@@ -722,6 +722,10 @@ def _call_gemini_chunk(
             return txns
         except Exception as e:
             print(f"  Chunk {chunk_num} attempt {attempt+1} failed: {e}")
+            err_msg = str(e).lower()
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "limit" in err_msg:
+                print(f"Rate limit / Quota hit on chunk {chunk_num}. Failsafe aborting retries.")
+                raise e
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s
             else:
