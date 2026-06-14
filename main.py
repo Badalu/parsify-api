@@ -141,7 +141,7 @@ def get_user_quota(user: dict) -> dict:
 
     tier = "registered"
     expiry_str = None
-    credits_limit = REGISTERED_PAGE_LIMIT  # will be overridden for subscribed
+    credits_limit = REGISTERED_STMT_LIMIT  # will be overridden for subscribed
 
     try:
         # Query 1: Profile
