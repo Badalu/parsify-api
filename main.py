@@ -63,8 +63,8 @@ app.add_middleware(
 )
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-ANON_PAGE_LIMIT            = 0    # anonymous disabled
-REGISTERED_PAGE_LIMIT      = 50   # free users: 50 pages per month (page-based)
+ANON_STMT_LIMIT            = 1    # anonymous users: 1 statement per day
+REGISTERED_STMT_LIMIT      = 2    # free users: 2 statements per day
 STARTER_STMT_LIMIT         = 40   # starter plan: 40 statements/month
 GROWTH_STMT_LIMIT          = 120  # growth plan: 120 statements/month
 PRO_STMT_LIMIT             = 400  # pro plan: 400 statements/month
@@ -106,14 +106,14 @@ def get_user_quota(user: dict) -> dict:
     if not SUPABASE_URL:
         return {
             "tier": "registered",
-            "credits_limit": REGISTERED_PAGE_LIMIT,
+            "credits_limit": REGISTERED_STMT_LIMIT,
             "units_used": 0,
-            "units_remaining": REGISTERED_PAGE_LIMIT,
-            "is_statement_based": False,
+            "units_remaining": REGISTERED_STMT_LIMIT,
+            "is_statement_based": True,
             "expired": False,
             # Legacy aliases kept for backward-compat:
             "pages_used": 0,
-            "pages_remaining": REGISTERED_PAGE_LIMIT,
+            "pages_remaining": REGISTERED_STMT_LIMIT,
         }
 
     headers = {
@@ -138,7 +138,7 @@ def get_user_quota(user: dict) -> dict:
             if tier == "subscribed":
                 credits_limit = raw_credits if raw_credits else STARTER_STMT_LIMIT
             else:
-                credits_limit = REGISTERED_PAGE_LIMIT
+                credits_limit = REGISTERED_STMT_LIMIT
     except Exception as e:
         print(f"Error fetching profile: {e}")
 
@@ -148,19 +148,20 @@ def get_user_quota(user: dict) -> dict:
         if expiry_str < datetime.now(timezone.utc).isoformat():
             tier = "registered"
             expired = True
-            credits_limit = REGISTERED_PAGE_LIMIT
+            credits_limit = REGISTERED_STMT_LIMIT
 
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(IST)
     month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
     # ── Usage counting depends on tier ──
-    is_statement_based = (tier == "subscribed")
+    is_statement_based = True
     units_used = 0
 
     try:
-        if is_statement_based:
-            # Count number of conversions (1 statement = 1 unit)
+        if tier == "subscribed":
+            # Count number of conversions (1 statement = 1 unit) THIS MONTH
             c_url = (
                 f"{SUPABASE_URL}/rest/v1/conversions?select=id"
                 f"&user_id=eq.{user['id']}&created_at=gte.{month_start}"
@@ -169,14 +170,14 @@ def get_user_quota(user: dict) -> dict:
             if c_res.status_code == 200:
                 units_used = len(c_res.json())
         else:
-            # Free user: count pages consumed
+            # Free user: count statements consumed TODAY
             c_url = (
-                f"{SUPABASE_URL}/rest/v1/conversions?select=pages"
-                f"&user_id=eq.{user['id']}&created_at=gte.{month_start}"
+                f"{SUPABASE_URL}/rest/v1/conversions?select=id"
+                f"&user_id=eq.{user['id']}&created_at=gte.{today_start}"
             )
             c_res = httpx.get(c_url, headers=headers)
             if c_res.status_code == 200:
-                units_used = sum(c.get("pages", 0) for c in c_res.json())
+                units_used = len(c_res.json())
     except Exception as e:
         print(f"Error fetching conversions: {e}")
 
@@ -240,6 +241,7 @@ async def convert_statement(
     categorize: Optional[bool] = Form(True),
     gst: Optional[bool] = Form(True),
     user: Optional[dict] = Depends(verify_user),
+    x_anon_id: Optional[str] = Header(None, alias="X-Anon-Id"),
 ):
     # ── Validate file ──
     if not file.filename.lower().endswith(".pdf"):
@@ -280,18 +282,37 @@ async def convert_statement(
 
         # ── Quota check ──
         if not user:
-            raise HTTPException(
-                status_code=401,
-                detail="Authentication required. Please sign up or sign in to convert bank statements."
-            )
+            if not x_anon_id:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authentication required. Please sign up or sign in to convert bank statements."
+                )
+            
+            if supabase:
+                IST = timezone(timedelta(hours=5, minutes=30))
+                today_start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                
+                res = await asyncio.to_thread(
+                    lambda: supabase.table("conversions").select("id").eq("user_id", x_anon_id).gte("created_at", today_start).execute()
+                )
+                anon_count = len(res.data) if res.data else 0
+                
+                if anon_count >= ANON_STMT_LIMIT:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Free daily limit reached. You have used your {ANON_STMT_LIMIT} free statement for today. Please sign up for more conversions."
+                    )
+            
+            user_id_for_log = x_anon_id
         else:
+            user_id_for_log = user["id"]
             quota = await asyncio.to_thread(get_user_quota, user)
 
             if quota["expired"]:
                 print(f"User {user['id']} subscription expired — treating as registered")
 
             if quota["units_remaining"] <= 0:
-                if quota["is_statement_based"]:
+                if quota["tier"] == "subscribed":
                     raise HTTPException(
                         status_code=403,
                         detail=f"Monthly statement limit reached. You have used all {quota['credits_limit']} statements this month. Wait for next month or upgrade your plan."
@@ -299,7 +320,7 @@ async def convert_statement(
                 else:
                     raise HTTPException(
                         status_code=403,
-                        detail=f"Free page quota exhausted. You have used all 50 pages this month. Register/upgrade to get more conversions."
+                        detail=f"Free daily quota exhausted. You have used your {REGISTERED_STMT_LIMIT} statements today. Register/upgrade to get more conversions."
                     )
 
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
@@ -331,13 +352,31 @@ async def convert_statement(
 
         cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
 
+        # Log anonymous conversion
+        if not user and supabase and x_anon_id:
+            try:
+                await asyncio.to_thread(
+                    lambda: supabase.table("conversions").insert({
+                        "user_id": x_anon_id,
+                        "file_name": file.filename,
+                        "bank": bank if bank != "auto" else None,
+                        "pages": page_count,
+                        "format": "Excel",
+                        "status": "done",
+                        "credits": page_count,
+                        "transactions_count": len(cleaned)
+                    }).execute()
+                )
+            except Exception as e:
+                print(f"Failed to log anon conversion: {e}")
+
         return {
             "success": True,
             "filename": file.filename,
             "pages": page_count,
             "transactions": cleaned,
             "transactions_count": len(cleaned),
-            "user_id": user["id"] if user else None,
+            "user_id": user_id_for_log,
         }
 
     finally:
