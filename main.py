@@ -57,6 +57,7 @@ app.add_middleware(
         "https://convertor.vercel.app",
         "https://convertor-pgzqlnnyc-badal-s-projects1.vercel.app",
     ],
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
