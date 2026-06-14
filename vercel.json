@@ -8,11 +8,11 @@
   "functions": {
     "api/index.py": {
       "maxDuration": 300,
-      "memory": 1024
+      "memory": 3008
     },
     "api/**/*.py": {
       "maxDuration": 300,
-      "memory": 1024
+      "memory": 3008
     }
   }
 }
