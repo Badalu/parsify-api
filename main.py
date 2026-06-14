@@ -4,7 +4,7 @@ import tempfile
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from typing import Optional, List
@@ -77,6 +77,20 @@ async def global_exception_handler(request, exc):
     return JSONResponse(
         status_code=500,
         content={"detail": f"Internal Server Error: {str(exc)}"},
+        headers={
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Allow-Methods": "*",
+        }
+    )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    origin = request.headers.get("origin", "*")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
         headers={
             "Access-Control-Allow-Origin": origin,
             "Access-Control-Allow-Credentials": "true",
@@ -258,6 +272,7 @@ def health_check():
 # ─── Single Convert ───────────────────────────────────────────────────────────
 @app.post("/api/convert")
 async def convert_statement(
+    request: Request,
     file: UploadFile = File(...),
     password: Optional[str] = Form(None),
     bank: Optional[str] = Form("auto"),
@@ -291,10 +306,20 @@ async def convert_statement(
             page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, password)
         except Exception as e:
             err = str(e).lower()
-            if "password" in err or "decrypt" in err or "encrypted" in err:
+            err_repr = repr(e).lower()
+            err_type = type(e).__name__.lower()
+            is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
+            if is_pwd_err:
+                origin = request.headers.get("origin", "*")
                 return JSONResponse(
                     status_code=401,
-                    content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."}
+                    content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."},
+                    headers={
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Allow-Credentials": "true",
+                        "Access-Control-Allow-Headers": "*",
+                        "Access-Control-Allow-Methods": "*",
+                    }
                 )
             raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
 
@@ -477,7 +502,10 @@ async def convert_batch(
                 page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, pwd)
             except Exception as e:
                 err = str(e).lower()
-                if "password" in err or "decrypt" in err:
+                err_repr = repr(e).lower()
+                err_type = type(e).__name__.lower()
+                is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
+                if is_pwd_err:
                     return {"index": idx, "filename": f.filename, "success": False,
                             "error": "password_required", "message": "PDF is password protected."}
                 return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
