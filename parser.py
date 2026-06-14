@@ -510,6 +510,19 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
 
                 page.flush_cache()
 
+        if not transactions:
+            print("[Native] No transactions found using table extraction. Trying line-by-line regex parser fallback...")
+            full_text_list = []
+            with pdfplumber.open(pdf_path, password=password) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text(layout=True)
+                    if page_text:
+                        full_text_list.append(page_text)
+                    page.flush_cache()
+            if full_text_list:
+                raw_text = "\n".join(full_text_list)
+                transactions = parse_line_by_line(raw_text)
+
     except Exception as e:
         print(f"Error during native PDF parsing: {e}")
 
