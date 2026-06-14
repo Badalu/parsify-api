@@ -9,6 +9,10 @@
     "api/index.py": {
       "maxDuration": 300,
       "memory": 1024
+    },
+    "api/**/*.py": {
+      "maxDuration": 300,
+      "memory": 1024
     }
   }
 }

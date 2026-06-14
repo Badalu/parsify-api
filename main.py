@@ -63,6 +63,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    print(traceback.format_exc())
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal Server Error: {str(exc)}"},
+        headers={"Access-Control-Allow-Origin": request.headers.get("origin", "*")}
+    )
+
+
 # ─── Constants ────────────────────────────────────────────────────────────────
 ANON_STMT_LIMIT            = 1    # anonymous users: 1 statement per day
 REGISTERED_STMT_LIMIT      = 2    # free users: 2 statements per day
