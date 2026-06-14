@@ -4,6 +4,7 @@ import json
 import time
 import hashlib
 import pdfplumber
+from pypdf import PdfReader
 import pandas as pd
 from typing import List, Dict, Any, Tuple, Optional
 from pydantic import BaseModel, Field
@@ -51,38 +52,49 @@ def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
     Returns (total_pages, is_text_based).
     """
     try:
-        with pdfplumber.open(pdf_path, password=password) as pdf:
-            total_pages = len(pdf.pages)
-            if total_pages == 0:
-                return 0, False
-            
-            # Check up to 2 pages to verify it's not just a scanned image
-            for i in range(min(2, total_pages)):
-                text = pdf.pages[i].extract_text()
-                if text and len(text.strip()) > 20:
-                    return total_pages, True
-            return total_pages, False
+        reader = PdfReader(pdf_path, password=password)
+        total_pages = len(reader.pages)
+        if total_pages == 0:
+            return 0, False
+        
+        # Check up to 2 pages to verify it's not just a scanned image
+        for i in range(min(2, total_pages)):
+            text = reader.pages[i].extract_text()
+            if text and len(text.strip()) > 20:
+                return total_pages, True
+        return total_pages, False
     except Exception as e:
         raise e
 
 def extract_full_text(pdf_path: str, password: str = None) -> str:
     """
-    Extracts full layout-aware text from all pages sequentially.
-    This is an expensive operation and should only be called as a fallback.
+    Extracts full text from all pages sequentially using pypdf for maximum speed,
+    with a robust fallback to pdfplumber layout-aware text extraction.
     """
-    extracted_pages = []
-    with pdfplumber.open(pdf_path, password=password) as pdf:
-        for page in pdf.pages:
-            try:
-                text = page.extract_text(layout=True)
-                if text:
-                    extracted_pages.append(text)
-            except Exception:
-                pass
-            finally:
-                page.flush_cache()
-
-    return "\n\n--- Page Break ---\n\n".join(extracted_pages)
+    try:
+        reader = PdfReader(pdf_path, password=password)
+        extracted_pages = []
+        for page in reader.pages:
+            extracted_pages.append(page.extract_text() or "")
+        return "\n\n--- Page Break ---\n\n".join(extracted_pages)
+    except Exception as e:
+        print(f"Error during pypdf text extraction: {e} — falling back to pdfplumber")
+        extracted_pages = []
+        try:
+            with pdfplumber.open(pdf_path, password=password) as pdf:
+                for page in pdf.pages:
+                    try:
+                        text = page.extract_text(layout=True)
+                        if text:
+                            extracted_pages.append(text)
+                    except Exception:
+                        pass
+                    finally:
+                        page.flush_cache()
+            return "\n\n--- Page Break ---\n\n".join(extracted_pages)
+        except Exception as e2:
+            print(f"Fallback pdfplumber text extraction failed: {e2}")
+            return ""
 
 
 # ── Native Rule-Based Parser Helpers ──────────────────────────────────────────
@@ -418,6 +430,23 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     """
     Extract transactions from structured PDF statements natively using pdfplumber without Gemini.
     """
+    start_time = time.time()
+    
+    # Check page count first. Large PDFs are bypassed on Vercel to avoid 10s gateway timeouts.
+    # Gemini fallback processes pages in parallel and runs within 4-5s total.
+    is_vercel = os.getenv("VERCEL") == "1" or os.getenv("VERCEL_ENV") is not None
+    max_pages = 12 if is_vercel else 100
+    
+    try:
+        reader = PdfReader(pdf_path, password=password)
+        total_pages = len(reader.pages)
+        if total_pages > max_pages:
+            print(f"[Native] PDF has {total_pages} pages (limit: {max_pages} pages). Bypassing native parsing to avoid timeouts.")
+            return []
+    except Exception as e:
+        print(f"[Native] Failed to check page count via pypdf: {e}")
+        # Proceed to try opening with pdfplumber
+
     transactions: List[Dict[str, Any]] = []
     header_mapping: Dict[str, int] = {}
 
@@ -425,6 +454,11 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
         with pdfplumber.open(pdf_path, password=password) as pdf:
             table_found = False
             for idx, page in enumerate(pdf.pages):
+                # Timeout check to prevent gateway timeouts on Vercel
+                if time.time() - start_time > 6.0:
+                    print(f"[Native] Timeout of 6.0s exceeded at page {idx+1}/{len(pdf.pages)}. Aborting native table parser.")
+                    return []
+
                 if idx >= 2 and not table_found:
                     print("[Native] No tables found in first 2 pages. Aborting table extraction for speed.")
                     break
