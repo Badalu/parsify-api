@@ -423,13 +423,19 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
 
     try:
         with pdfplumber.open(pdf_path, password=password) as pdf:
-            for page in pdf.pages:
+            table_found = False
+            for idx, page in enumerate(pdf.pages):
+                if idx >= 2 and not table_found:
+                    print("[Native] No tables found in first 2 pages. Aborting table extraction for speed.")
+                    break
                 tables = page.extract_tables()
                 if not tables:
                     try:
                         tables = [t.extract() for t in page.find_tables()]
                     except Exception:
                         tables = []
+                if tables:
+                    table_found = True
 
                 for table in tables:
                     if not table:
