@@ -25,6 +25,7 @@ from parser import (
     clean_and_format_transactions,
     generate_excel_file,
     generate_csv_file,
+    categorize_and_tag_with_gemini,
 )
 from supabase import create_client, Client
 
@@ -375,6 +376,7 @@ async def convert_statement(
 
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
         raw_txns = []
+        gemini_used_for_extraction = False
         print(f"[Native] Parsing: {file.filename} ({page_count} pages)")
 
         try:
@@ -382,7 +384,7 @@ async def convert_statement(
             if raw_txns:
                 print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
         except Exception as e:
-            print(f"[Native] ❌ Failed: {e} — trying Gemini parser")
+            print(f"[Native] ❌ Failed: {e} — trying line-by-line regex fallback")
 
         if not raw_txns:
             print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
@@ -392,7 +394,19 @@ async def convert_statement(
                 if raw_txns:
                     print(f"[Native] ✅ {len(raw_txns)} transactions extracted via regex line fallback")
             except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Native line parser failed: {e}")
+                print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
+
+        # ── Gemini Fallback ──
+        if not raw_txns:
+            print(f"[Gemini] Fallback parsing starting: {file.filename}")
+            try:
+                text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                if raw_txns:
+                    gemini_used_for_extraction = True
+                    print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted via fallback")
+            except Exception as e:
+                print(f"[Gemini] ❌ Fallback parsing failed: {e}")
 
         if not raw_txns:
             raise HTTPException(
@@ -401,6 +415,15 @@ async def convert_statement(
             )
 
         cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
+
+        # ── AI Categorization & GST Tagging ──
+        if not gemini_used_for_extraction and (categorize or gst):
+            print(f"[Gemini] Categorizing and tagging GST with Gemini 2.0 Flash for {len(cleaned)} transactions...")
+            try:
+                cleaned = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
+                print(f"[Gemini] ✅ AI Categorization/GST completed")
+            except Exception as e:
+                print(f"[Gemini] ❌ AI Categorization failed: {e} — using local rule results")
 
         # Log anonymous conversion
         if not user and supabase and x_anon_id:
@@ -524,6 +547,7 @@ async def convert_batch(
 
             # Parse natively first for extreme speed
             raw_txns = []
+            gemini_used_for_extraction = False
             try:
                 raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
             except Exception as e:
@@ -534,14 +558,31 @@ async def convert_batch(
                     text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
                     raw_txns = parse_line_by_line(text)
                 except Exception as e:
-                    return {"index": idx, "filename": f.filename, "success": False,
-                            "error": f"Native line parser failed: {e}"}
+                    pass
+
+            if not raw_txns:
+                print(f"[Gemini] Fallback parsing starting for batch file: {f.filename}")
+                try:
+                    text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
+                    raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                    if raw_txns:
+                        gemini_used_for_extraction = True
+                except Exception as e:
+                    print(f"[Gemini] Batch fallback failed for {f.filename}: {e}")
 
             if not raw_txns:
                 return {"index": idx, "filename": f.filename, "success": False,
                         "error": "No transactions detected."}
 
             cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
+
+            # AI Categorization & GST Tagging
+            if not gemini_used_for_extraction and (categorize or gst):
+                try:
+                    cleaned = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
+                except Exception as e:
+                    print(f"[Gemini] Batch categorization failed for {f.filename}: {e}")
+
             return {
                 "index": idx,
                 "filename": f.filename,

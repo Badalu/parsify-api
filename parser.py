@@ -46,6 +46,15 @@ class TransactionItem(BaseModel):
 class TransactionsList(BaseModel):
     transactions: List[TransactionItem]
 
+class CategorizationItem(BaseModel):
+    index: int = Field(description="The index of the transaction in the input list")
+    category: str = Field(description="Assigned category: Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other")
+    gst: str = Field(description="If GST splits are found, e.g. 'CGST+SGST', else empty")
+
+class CategorizationList(BaseModel):
+    items: List[CategorizationItem]
+
+
 def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
     """
     Swiftly checks page count and whether the document is text-based by reading just the first two pages.
@@ -841,6 +850,119 @@ def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> L
 
     print(f"Gemini total extracted: {len(result)} transactions")
     return result
+
+
+def categorize_and_tag_with_gemini(
+    transactions: List[Dict[str, Any]],
+    categorize: bool = True,
+    gst: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Categorize transactions and tag GST using Gemini 2.0 Flash in batches.
+    Falls back to local rules defensively if the API call fails.
+    """
+    if not transactions:
+        return []
+    if not GEMINI_API_KEY:
+        print("[Gemini] API Key not set, using local rule-based categories.")
+        return transactions
+
+    system_prompt = (
+        "You are a highly accurate financial transactions categorizer. Your task is to assign a category "
+        "and detect GST for each transaction description provided.\n\n"
+        "Categories to choose from:\n"
+        "Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other\n\n"
+        "GST detection:\n"
+        "- 'CGST+SGST' if description mentions CGST and SGST\n"
+        "- 'IGST' if IGST is mentioned\n"
+        "- 'GST' if generic GST is mentioned\n"
+        "- '' (empty string) if no GST is mentioned\n\n"
+        "Ensure you return a list of objects containing the index of the transaction, the category, and the gst value."
+    )
+
+    # Prepare input list: only send index and description to minimize token usage
+    input_items = [{"index": idx, "description": txn.get("description", "")} for idx, txn in enumerate(transactions)]
+
+    # Split into chunks of 150 to stay well within limits
+    chunk_size = 150
+    chunks = [input_items[i:i + chunk_size] for i in range(0, len(input_items), chunk_size)]
+    
+    if GENAI_NEW_SDK:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    else:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+
+    categorized_items = {}
+
+    for c_idx, chunk in enumerate(chunks):
+        user_message = f"Process this chunk of transactions:\n{json.dumps(chunk)}"
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if GENAI_NEW_SDK:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=user_message,
+                        config=genai_types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            response_mime_type="application/json",
+                            response_schema=CategorizationList,
+                            temperature=0,
+                        )
+                    )
+                    raw = response.text
+                else:
+                    response = model.generate_content(
+                        contents=[{"role": "user", "parts": [user_message]}],
+                        generation_config=genai.GenerationConfig(
+                            response_mime_type="application/json",
+                            response_schema=CategorizationList,
+                            temperature=0,
+                        )
+                    )
+                    raw = response.text
+                
+                raw = raw.strip()
+                if raw.startswith("```json"):
+                    raw = raw[7:]
+                if raw.startswith("```"):
+                    raw = raw[3:]
+                if raw.endswith("```"):
+                    raw = raw[:-3]
+                raw = raw.strip()
+                
+                data = json.loads(raw)
+                for item in data.get("items", []):
+                    idx = item.get("index")
+                    if idx is not None:
+                        categorized_items[int(idx)] = {
+                            "category": item.get("category", "Other") if categorize else "Other",
+                            "gst": item.get("gst", "") if gst else ""
+                        }
+                break  # Success
+            except Exception as e:
+                print(f"[Gemini Categorize] Chunk {c_idx+1} attempt {attempt+1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    print(f"[Gemini Categorize] Falling back to local rules for chunk {c_idx+1}")
+                    for item in chunk:
+                        idx = item["index"]
+                        categorized_items[idx] = {
+                            "category": transactions[idx].get("category", "Other"),
+                            "gst": transactions[idx].get("gst", "")
+                        }
+
+    # Merge back into transactions
+    for idx, txn in enumerate(transactions):
+        cat_info = categorized_items.get(idx)
+        if cat_info:
+            txn["category"] = cat_info["category"]
+            txn["gst"] = cat_info["gst"]
+
+    return transactions
+
 
 
 def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str = "DD/MM/YYYY") -> List[Dict[str, Any]]:
