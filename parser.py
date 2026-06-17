@@ -445,8 +445,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     
     # Check page count first. Large PDFs are bypassed on Vercel to avoid 10s gateway timeouts.
     # Gemini fallback processes pages in parallel and runs within 4-5s total.
-    is_vercel = os.getenv("VERCEL") == "1" or os.getenv("VERCEL_ENV") is not None
-    max_pages = 12 if is_vercel else 100
+    max_pages = 100
     
     try:
         reader = PdfReader(pdf_path, password=password)
@@ -466,8 +465,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
             table_found = False
             for idx, page in enumerate(pdf.pages):
                 # Timeout check to prevent gateway timeouts on Vercel
-                if time.time() - start_time > 6.0:
-                    print(f"[Native] Timeout of 6.0s exceeded at page {idx+1}/{len(pdf.pages)}. Aborting native table parser.")
+                if time.time() - start_time > 25.0:
+                    print(f"[Native] Timeout of 25.0s exceeded at page {idx+1}/{len(pdf.pages)}. Aborting native table parser.")
                     return []
 
                 if idx >= 2 and not table_found:
