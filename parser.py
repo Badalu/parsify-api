@@ -1106,3 +1106,136 @@ def generate_csv_file(txns: List[Dict[str, Any]], file_path: str):
     cols = [c for c in cols if c in df.columns]
     df = df[cols]
     df.to_csv(file_path, index=False, encoding='utf-8-sig')  # utf-8-sig for Excel compat
+
+
+def parse_file_directly_with_gemini(
+    file_path: str,
+    mime_type: str,
+    categorize: bool = True,
+    gst: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Uploads a file (scanned PDF or image screenshot) to Gemini Files API,
+    parses it using Gemini 2.5 Flash, and returns structured transactions.
+    """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
+
+    system_prompt = _build_system_prompt(categorize, gst)
+    user_message = (
+        "Extract ALL transactions from this bank statement document/image. "
+        "Return every transaction row, do not skip any."
+    )
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        uploaded_file = None
+        try:
+            if GENAI_NEW_SDK:
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                print(f"[Gemini Direct] Uploading file to Files API: {file_path} (type: {mime_type})")
+                uploaded_file = client.files.upload(file=file_path)
+                
+                # Wait for the file to be processed if it's a PDF (images are active immediately)
+                if mime_type == "application/pdf":
+                    state_str = str(uploaded_file.state).upper()
+                    wait_time = 0
+                    while "PROCESSING" in state_str and wait_time < 30:
+                        print("Waiting for PDF to be processed in Files API...")
+                        time.sleep(2)
+                        wait_time += 2
+                        uploaded_file = client.files.get(name=uploaded_file.name)
+                        state_str = str(uploaded_file.state).upper()
+                    
+                    if "ACTIVE" not in state_str:
+                        raise Exception(f"File state is {state_str}, cannot process.")
+                
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[uploaded_file, user_message],
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        response_mime_type="application/json",
+                        response_schema=TransactionsList,
+                        temperature=0,
+                    )
+                )
+                raw = response.text
+            else:
+                genai.configure(api_key=GEMINI_API_KEY)
+                model = genai.GenerativeModel(
+                    model_name="gemini-2.5-flash",
+                    system_instruction=system_prompt
+                )
+                print(f"[Gemini Direct] Uploading file to legacy Files API: {file_path} (type: {mime_type})")
+                uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
+                
+                if mime_type == "application/pdf":
+                    state_str = str(uploaded_file.state).upper()
+                    wait_time = 0
+                    while "PROCESSING" in state_str and wait_time < 30:
+                        print("Waiting for PDF to be processed in legacy Files API...")
+                        time.sleep(2)
+                        wait_time += 2
+                        uploaded_file = genai.get_file(uploaded_file.name)
+                        state_str = str(uploaded_file.state).upper()
+                    
+                    if "ACTIVE" not in state_str:
+                        raise Exception(f"File state is {state_str}, cannot process.")
+
+                response = model.generate_content(
+                    contents=[uploaded_file, user_message],
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        response_schema=TransactionsList,
+                        temperature=0,
+                    )
+                )
+                raw = response.text
+
+            # Clean up potential markdown formatting
+            raw = raw.strip()
+            if raw.startswith("```json"):
+                raw = raw[7:]
+            if raw.startswith("```"):
+                raw = raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+
+            data = json.loads(raw)
+            txns = data.get("transactions", [])
+            
+            # Normalize list items to dict
+            result = []
+            for txn in txns:
+                if isinstance(txn, dict):
+                    result.append(txn)
+                else:
+                    result.append(txn.model_dump() if hasattr(txn, 'model_dump') else dict(txn))
+
+            print(f"[Gemini Direct] [OK] Successfully extracted {len(result)} transactions")
+            return result
+
+        except Exception as e:
+            print(f"[Gemini Direct] Attempt {attempt+1} failed: {e}")
+            err_msg = str(e).lower()
+            if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                raise
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                raise
+        finally:
+            if uploaded_file:
+                try:
+                    if GENAI_NEW_SDK:
+                        client = genai.Client(api_key=GEMINI_API_KEY)
+                        client.files.delete(name=uploaded_file.name)
+                    else:
+                        uploaded_file.delete()
+                    print("[Gemini Direct] Cleaned up uploaded file from Files API")
+                except Exception as ex:
+                    print(f"[Gemini Direct] Cleanup failed: {ex}")
+    return []
+

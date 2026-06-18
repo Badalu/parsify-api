@@ -26,6 +26,8 @@ from parser import (
     generate_excel_file,
     generate_csv_file,
     categorize_and_tag_with_gemini,
+    parse_file_directly_with_gemini,
+    is_valid_date,
 )
 from supabase import create_client, Client
 
@@ -254,6 +256,32 @@ class DownloadRequest(BaseModel):
     format: str  # "xlsx" or "csv"
 
 
+def evaluate_native_confidence(txns: List[dict], page_count: int) -> bool:
+    if not txns:
+        return False
+        
+    total_txns = len(txns)
+    
+    # 1. Check average txns per page (very loose check)
+    if total_txns < max(1, page_count) * 2 and page_count > 1:
+        print(f"[Native Confidence] Low txn count: {total_txns} for {page_count} pages.")
+        return False
+        
+    # 2. Check completeness (missing amounts)
+    incomplete_count = sum(1 for t in txns if not str(t.get("debit", "")).strip() and not str(t.get("credit", "")).strip())
+    if incomplete_count > total_txns * 0.3:
+        print(f"[Native Confidence] Low completeness: {incomplete_count}/{total_txns} lack amounts.")
+        return False
+        
+    # 3. Check for valid dates
+    invalid_dates = sum(1 for t in txns if not is_valid_date(t.get("date", "")))
+    if invalid_dates > total_txns * 0.3:
+        print(f"[Native Confidence] Invalid dates: {invalid_dates}/{total_txns} have bad dates.")
+        return False
+        
+    return True
+
+
 # ─── Root ───────────────────────────────────────────────────────────────────
 @app.get("/")
 def read_root():
@@ -285,8 +313,19 @@ async def convert_statement(
     x_anon_id: Optional[str] = Header(None, alias="X-Anon-Id"),
 ):
     # ── Validate file ──
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+    filename_lower = file.filename.lower()
+    supported_extensions = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+    if not filename_lower.endswith(supported_extensions):
+        raise HTTPException(status_code=400, detail="Unsupported file format. Please upload PDF, PNG, JPG, or WEBP.")
+
+    is_image = filename_lower.endswith((".png", ".jpg", ".jpeg", ".webp"))
+    mime_type = "application/pdf"
+    if filename_lower.endswith(".png"):
+        mime_type = "image/png"
+    elif filename_lower.endswith((".jpg", ".jpeg")):
+        mime_type = "image/jpeg"
+    elif filename_lower.endswith(".webp"):
+        mime_type = "image/webp"
 
     temp_path = os.path.join(tempfile.gettempdir(), f"sc_{os.urandom(6).hex()}_{file.filename}")
 
@@ -303,33 +342,34 @@ async def convert_statement(
                 detail=f"File too large ({file_size_mb:.1f} MB). Maximum allowed: {MAX_FILE_SIZE_MB} MB."
             )
 
-        # ── Extract page count & basic text check ──
-        try:
-            page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, password)
-        except Exception as e:
-            err = str(e).lower()
-            err_repr = repr(e).lower()
-            err_type = type(e).__name__.lower()
-            is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
-            if is_pwd_err:
-                origin = request.headers.get("origin", "*")
-                return JSONResponse(
-                    status_code=401,
-                    content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."},
-                    headers={
-                        "Access-Control-Allow-Origin": origin,
-                        "Access-Control-Allow-Credentials": "true",
-                        "Access-Control-Allow-Headers": "*",
-                        "Access-Control-Allow-Methods": "*",
-                    }
-                )
-            raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
+        is_text_based = False
+        if is_image:
+            page_count = 1
+        else:
+            # ── Extract page count & basic text check ──
+            try:
+                page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, password)
+            except Exception as e:
+                err = str(e).lower()
+                err_repr = repr(e).lower()
+                err_type = type(e).__name__.lower()
+                is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
+                if is_pwd_err:
+                    origin = request.headers.get("origin", "*")
+                    return JSONResponse(
+                        status_code=401,
+                        content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."},
+                        headers={
+                            "Access-Control-Allow-Origin": origin,
+                            "Access-Control-Allow-Credentials": "true",
+                            "Access-Control-Allow-Headers": "*",
+                            "Access-Control-Allow-Methods": "*",
+                        }
+                    )
+                raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
 
-        if not is_text_based or page_count == 0:
-            raise HTTPException(
-                status_code=422,
-                detail="Could not extract text from this PDF. It may be a scanned image. Please upload a text-based bank statement."
-            )
+            if page_count == 0:
+                raise HTTPException(status_code=422, detail="The PDF statement is empty.")
 
         # ── Quota check ──
         if not user:
@@ -377,42 +417,89 @@ async def convert_statement(
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
         raw_txns = []
         gemini_used_for_extraction = False
-        print(f"[Native] Parsing: {file.filename} ({page_count} pages)")
 
-        try:
-            raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
-            if raw_txns:
-                print(f"[Native] ✅ {len(raw_txns)} transactions extracted")
-        except Exception as e:
-            print(f"[Native] ❌ Failed: {e} — trying line-by-line regex fallback")
-
-        if not raw_txns:
-            print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
+        if not is_image and is_text_based:
+            print(f"[Native] Parsing: {file.filename} ({page_count} pages)")
+            native_success = False
+            low_confidence_txns = []
+            
             try:
-                text = await asyncio.to_thread(extract_full_text, temp_path, password)
-                raw_txns = parse_line_by_line(text)
+                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
                 if raw_txns:
-                    print(f"[Native] ✅ {len(raw_txns)} transactions extracted via regex line fallback")
+                    print(f"[Native] [OK] {len(raw_txns)} transactions extracted natively")
+                    if evaluate_native_confidence(raw_txns, page_count):
+                        native_success = True
+                    else:
+                        print(f"[Native] [WARN] Low confidence natively. Discarding results.")
+                        low_confidence_txns = raw_txns
+                        raw_txns = []
             except Exception as e:
-                print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
+                print(f"[Native] [ERROR] Failed: {e} — trying line-by-line regex fallback")
 
-        # ── Gemini Fallback ──
-        if not raw_txns:
-            print(f"[Gemini] Fallback parsing starting: {file.filename}")
+            if not raw_txns and not native_success:
+                print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
+                try:
+                    text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                    raw_txns = parse_line_by_line(text)
+                    if raw_txns:
+                        print(f"[Native] [OK] {len(raw_txns)} transactions extracted via regex line fallback")
+                        if evaluate_native_confidence(raw_txns, page_count):
+                            native_success = True
+                        else:
+                            print(f"[Native] [WARN] Low confidence line-by-line. Discarding results.")
+                            if not low_confidence_txns:
+                                low_confidence_txns = raw_txns
+                            raw_txns = []
+                except Exception as e:
+                    print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
+
+            # ── Gemini Fallback ──
+            if not raw_txns:
+                print(f"[Gemini] Fallback parsing starting: {file.filename}")
+                try:
+                    text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                    raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                    if raw_txns:
+                        gemini_used_for_extraction = True
+                        print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via fallback")
+                except Exception as e:
+                    print(f"[Gemini] [ERROR] Fallback parsing failed: {e}")
+                    if low_confidence_txns:
+                        print(f"[Gemini] Rescuing low confidence native txns due to API failure.")
+                        raw_txns = low_confidence_txns
+                    else:
+                        err_msg = str(e).lower()
+                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                            raise HTTPException(
+                                status_code=402,
+                                detail="Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."
+                            )
+        else:
+            # Scanned PDF or Image screenshot: parse directly via Files API multimodal
+            print(f"[Gemini Direct] Parsing scanned PDF or Image directly: {file.filename}")
             try:
-                text = await asyncio.to_thread(extract_full_text, temp_path, password)
-                raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                raw_txns = await asyncio.to_thread(
+                    parse_file_directly_with_gemini,
+                    temp_path,
+                    mime_type,
+                    categorize=categorize,
+                    gst=gst
+                )
                 if raw_txns:
                     gemini_used_for_extraction = True
-                    print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted via fallback")
+                    print(f"[Gemini Direct] [OK] {len(raw_txns)} transactions extracted directly")
             except Exception as e:
-                print(f"[Gemini] ❌ Fallback parsing failed: {e}")
+                print(f"[Gemini Direct] [ERROR] Direct parsing failed: {e}")
                 err_msg = str(e).lower()
                 if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
                     raise HTTPException(
                         status_code=402,
                         detail="Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."
                     )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to parse document: {str(e)}"
+                )
 
         if not raw_txns:
             raise HTTPException(
@@ -427,9 +514,9 @@ async def convert_statement(
             print(f"[Gemini] Categorizing and tagging GST with Gemini 2.0 Flash for {len(cleaned)} transactions...")
             try:
                 cleaned = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
-                print(f"[Gemini] ✅ AI Categorization/GST completed")
+                print(f"[Gemini] [OK] AI Categorization/GST completed")
             except Exception as e:
-                print(f"[Gemini] ❌ AI Categorization failed: {e} — using local rule results")
+                print(f"[Gemini] [ERROR] AI Categorization failed: {e} — using local rule results")
 
         # Log anonymous conversion
         if not user and supabase and x_anon_id:
@@ -528,21 +615,39 @@ async def convert_batch(
 
             pwd = pwd_map.get(str(idx)) or pwd_map.get(idx)
 
-            try:
-                page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, pwd)
-            except Exception as e:
-                err = str(e).lower()
-                err_repr = repr(e).lower()
-                err_type = type(e).__name__.lower()
-                is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
-                if is_pwd_err:
-                    return {"index": idx, "filename": f.filename, "success": False,
-                            "error": "password_required", "message": "PDF is password protected."}
-                return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
-
-            if not is_text_based or page_count == 0:
+            filename_lower = f.filename.lower()
+            supported_extensions = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+            if not filename_lower.endswith(supported_extensions):
                 return {"index": idx, "filename": f.filename, "success": False,
-                        "error": "Could not extract text. May be a scanned image."}
+                        "error": "Unsupported file format. Please upload PDF, PNG, JPG, or WEBP."}
+
+            is_image = filename_lower.endswith((".png", ".jpg", ".jpeg", ".webp"))
+            mime_type = "application/pdf"
+            if filename_lower.endswith(".png"):
+                mime_type = "image/png"
+            elif filename_lower.endswith((".jpg", ".jpeg")):
+                mime_type = "image/jpeg"
+            elif filename_lower.endswith(".webp"):
+                mime_type = "image/webp"
+
+            is_text_based = False
+            if is_image:
+                page_count = 1
+            else:
+                try:
+                    page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, pwd)
+                except Exception as e:
+                    err = str(e).lower()
+                    err_repr = repr(e).lower()
+                    err_type = type(e).__name__.lower()
+                    is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
+                    if is_pwd_err:
+                        return {"index": idx, "filename": f.filename, "success": False,
+                                "error": "password_required", "message": "PDF is password protected."}
+                    return {"index": idx, "filename": f.filename, "success": False, "error": str(e)}
+
+                if page_count == 0:
+                    return {"index": idx, "filename": f.filename, "success": False, "error": "Empty PDF."}
 
             # Per-file quota check: paid plans count statements, not pages
             # (quota was fetched once before the batch loop)
@@ -554,31 +659,70 @@ async def convert_batch(
             # Parse natively first for extreme speed
             raw_txns = []
             gemini_used_for_extraction = False
-            try:
-                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
-            except Exception as e:
-                print(f"[Native] Failed for {f.filename}: {e}")
 
-            if not raw_txns:
+            if not is_image and is_text_based:
+                native_success = False
+                low_confidence_txns = []
                 try:
-                    text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
-                    raw_txns = parse_line_by_line(text)
+                    raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, pwd)
+                    if raw_txns and evaluate_native_confidence(raw_txns, page_count):
+                        native_success = True
+                    elif raw_txns:
+                        low_confidence_txns = raw_txns
+                        raw_txns = []
                 except Exception as e:
-                    pass
+                    print(f"[Native] Failed for {f.filename}: {e}")
 
-            if not raw_txns:
-                print(f"[Gemini] Fallback parsing starting for batch file: {f.filename}")
+                if not raw_txns and not native_success:
+                    try:
+                        text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
+                        raw_txns = parse_line_by_line(text)
+                        if raw_txns and evaluate_native_confidence(raw_txns, page_count):
+                            native_success = True
+                        elif raw_txns:
+                            if not low_confidence_txns:
+                                low_confidence_txns = raw_txns
+                            raw_txns = []
+                    except Exception as e:
+                        pass
+
+                if not raw_txns:
+                    print(f"[Gemini] Fallback parsing starting for batch file: {f.filename}")
+                    try:
+                        text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
+                        raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                    except Exception as e:
+                        print(f"[Gemini] Batch fallback failed for {f.filename}: {e}")
+                        if low_confidence_txns:
+                            print(f"[Gemini] Rescuing low confidence native txns due to API failure.")
+                            raw_txns = low_confidence_txns
+                        else:
+                            err_msg = str(e).lower()
+                            if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                                return {"index": idx, "filename": f.filename, "success": False,
+                                        "error": "Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."}
+            else:
+                # Scanned PDF or Image screenshot
+                print(f"[Gemini Direct] Batch processing scanned PDF or Image directly: {f.filename}")
                 try:
-                    text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
-                    raw_txns = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                    raw_txns = await asyncio.to_thread(
+                        parse_file_directly_with_gemini,
+                        temp_path,
+                        mime_type,
+                        categorize=categorize,
+                        gst=gst
+                    )
                     if raw_txns:
                         gemini_used_for_extraction = True
                 except Exception as e:
-                    print(f"[Gemini] Batch fallback failed for {f.filename}: {e}")
+                    print(f"[Gemini Direct] Batch direct parsing failed for {f.filename}: {e}")
                     err_msg = str(e).lower()
                     if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
                         return {"index": idx, "filename": f.filename, "success": False,
                                 "error": "Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."}
+                    return {"index": idx, "filename": f.filename, "success": False, "error": f"AI parsing failed: {str(e)}"}
 
             if not raw_txns:
                 return {"index": idx, "filename": f.filename, "success": False,
