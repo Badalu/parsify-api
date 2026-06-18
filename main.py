@@ -407,6 +407,12 @@ async def convert_statement(
                     print(f"[Gemini] ✅ {len(raw_txns)} transactions extracted via fallback")
             except Exception as e:
                 print(f"[Gemini] ❌ Fallback parsing failed: {e}")
+                err_msg = str(e).lower()
+                if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                    raise HTTPException(
+                        status_code=402,
+                        detail="Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."
+                    )
 
         if not raw_txns:
             raise HTTPException(
@@ -569,10 +575,14 @@ async def convert_batch(
                         gemini_used_for_extraction = True
                 except Exception as e:
                     print(f"[Gemini] Batch fallback failed for {f.filename}: {e}")
+                    err_msg = str(e).lower()
+                    if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                        return {"index": idx, "filename": f.filename, "success": False,
+                                "error": "Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."}
 
             if not raw_txns:
                 return {"index": idx, "filename": f.filename, "success": False,
-                        "error": "No transactions detected."}
+                        "error": "No transactions detected. Make sure it is a valid Indian bank statement."}
 
             cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
 
