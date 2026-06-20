@@ -1,3 +1,20 @@
+"""
+parser.py — Parsify.in Hybrid PDF Parser
+=========================================
+Production-ready bank statement parser for Indian Chartered Accountants.
+
+Parsing flow (cost-optimized):
+  1. check_pdf_basic()       — read first 2 pages, detect text vs scanned
+  2. SCANNED → Gemini File API (1 API call, handles OCR)
+  3. TEXT-BASED → native pdfplumber table extraction (0 API calls)
+  4. Native fails → line-by-line regex parser (0 API calls)
+  5. Native < 5 txns → is_text_quality_sufficient()
+  6. Quality OK → Gemini text chunks (1-2 API calls)
+  7. Quality poor → Gemini File API (1 API call)
+
+SDK: Prefers google.genai (new SDK), falls back to google.generativeai (legacy).
+"""
+
 import os
 import re
 import json
@@ -8,10 +25,10 @@ from pypdf import PdfReader
 import pandas as pd
 from typing import List, Dict, Any, Tuple, Optional
 from pydantic import BaseModel, Field
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import importlib.util as _ilu
 
+# ── SDK Detection ─────────────────────────────────────────────────────────────
 # Prefer the new google-genai SDK; fall back to the old google-generativeai
 if _ilu.find_spec("google.genai") is not None:
     from google import genai
@@ -22,42 +39,110 @@ else:
     genai_types = None
     GENAI_NEW_SDK = False
 
-# Initialize Gemini SDK
+# ── Configuration ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Increased parallelization — Gemini 2.5 Flash is extremely fast. 
-# We split into smaller chunks (approx 2-3 pages) to force parallel execution.
-GEMINI_CHUNK_SIZE = 150_000
+# Larger chunks = fewer API calls = lower cost
+GEMINI_CHUNK_SIZE = 200_000
 
-# Max parallel workers for concurrent Gemini chunk calls
-GEMINI_MAX_WORKERS = 2
+# ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
-# Define schemas for structured Gemini output
 class TransactionItem(BaseModel):
-    date: str = Field(description="The posting date of the transaction (exactly as listed in the statement)")
-    value_date: str = Field(description="The value date or clearing date of the transaction if explicitly listed in the statement, else same as date")
-    description: str = Field(description="The description or particulars of the transaction")
-    debit: str = Field(description="The debit amount (withdrawal), normalized without currency symbols, empty if none")
-    credit: str = Field(description="The credit amount (deposit), normalized without currency symbols, empty if none")
-    balance: str = Field(description="The running balance after transaction, empty if none")
-    category: str = Field(description="Assigned category: Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other")
-    gst: str = Field(description="If GST splits are found, e.g. 'CGST+SGST', else empty")
+    date: str = Field(description="Transaction date exactly as shown in the statement")
+    value_date: str = Field(description="Value/clearing date if listed separately, else same as date")
+    description: str = Field(description="Full transaction narration/particulars")
+    debit: str = Field(description="Withdrawal amount, digits only, empty if none")
+    credit: str = Field(description="Deposit amount, digits only, empty if none")
+    balance: str = Field(description="Running balance after transaction, digits only, empty if none")
+    category: str = Field(description="Category: Salary|Food|Fuel|Rent|Utilities|Shopping|Groceries|Transfer|Subscription|GST|Tax|Investment|EMI|Refund|Other")
+    gst: str = Field(description="CGST+SGST | IGST | GST | empty string")
+
 
 class TransactionsList(BaseModel):
     transactions: List[TransactionItem]
 
+
 class CategorizationItem(BaseModel):
-    index: int = Field(description="The index of the transaction in the input list")
-    category: str = Field(description="Assigned category: Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other")
-    gst: str = Field(description="If GST splits are found, e.g. 'CGST+SGST', else empty")
+    index: int = Field(description="Index of the transaction in the input list")
+    category: str = Field(description="Category: Salary|Food|Fuel|Rent|Utilities|Shopping|Groceries|Transfer|Subscription|GST|Tax|Investment|EMI|Refund|Other")
+    gst: str = Field(description="CGST+SGST | IGST | GST | empty string")
+
 
 class CategorizationList(BaseModel):
     items: List[CategorizationItem]
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPTS — Minimal tokens (~350 tokens max), cost-optimized
+# ══════════════════════════════════════════════════════════════════════════════
+
+SYSTEM_PROMPT_PARSE_ONLY = (
+    "Extract every transaction from the bank statement. Never skip, never hallucinate.\n"
+    "Fields: date (exactly as shown), value_date (if separate column, else copy date), "
+    "description (full narration including UPI IDs/refs), "
+    "debit (digits only, empty if none), credit (digits only, empty if none), "
+    "balance (digits only, empty if none), category=Other, gst=empty string.\n"
+    "Skip: headers, footers, opening/closing balance summary rows, blank rows.\n"
+    "Bank columns: SBI=Txn Date|Value Date|Description|Debit|Credit|Balance, "
+    "HDFC=Date|Narration|Value Dt|Withdrawal Amt|Deposit Amt|Closing Balance, "
+    "ICICI=Transaction Date|Value Date|Particulars|Deposits|Withdrawals|Balance, "
+    "Axis=Tran Date|Particulars|Debit|Credit|Balance, "
+    "Kotak=Date|Description|Debit|Credit|Balance, "
+    "IDFC/IndusInd/Yes Bank=compact Dr/Cr style.\n"
+    "Amounts: strip ₹ Rs. INR $ symbols, strip comma separators, strip Dr/Cr suffix. "
+    "Multi-line descriptions: concatenate with space."
+)
+
+SYSTEM_PROMPT_WITH_CATEGORIES = (
+    "Extract every transaction from the bank statement. Never skip, never hallucinate.\n"
+    "Fields: date (exactly as shown), value_date (if separate column, else copy date), "
+    "description (full narration including UPI IDs/refs), "
+    "debit (digits only, empty if none), credit (digits only, empty if none), "
+    "balance (digits only, empty if none), category (from list below), gst (see below).\n"
+    "Skip: headers, footers, opening/closing balance summary rows, blank rows.\n"
+    "Bank columns: SBI=Txn Date|Value Date|Description|Debit|Credit|Balance, "
+    "HDFC=Date|Narration|Value Dt|Withdrawal Amt|Deposit Amt|Closing Balance, "
+    "ICICI=Transaction Date|Value Date|Particulars|Deposits|Withdrawals|Balance, "
+    "Axis=Tran Date|Particulars|Debit|Credit|Balance, "
+    "Kotak=Date|Description|Debit|Credit|Balance, "
+    "IDFC/IndusInd/Yes Bank=compact Dr/Cr style.\n"
+    "Amounts: strip ₹ Rs. INR $ symbols, strip comma separators, strip Dr/Cr suffix.\n"
+    "Categories (pick exactly one): "
+    "Salary=payroll/NEFT salary, Food=Zomato/Swiggy/restaurant, "
+    "Fuel=petrol/diesel/HPCL/BPCL, Rent=house rent/PG, "
+    "Utilities=electricity/Jio/Airtel, Shopping=Amazon/Flipkart/Myntra, "
+    "Groceries=Blinkit/Zepto/BigBasket, "
+    "Transfer=UPI/NEFT/RTGS/IMPS/GPay/PhonePe, "
+    "Subscription=Netflix/Spotify/Prime, GST=CGST/SGST/IGST payments, "
+    "Tax=income tax/TDS, Investment=Zerodha/Groww/SIP/MF, "
+    "EMI=loan EMI/home loan/car loan, Refund=refund/cashback/reversal, "
+    "Other=unclassified.\n"
+    "GST field: CGST+SGST if both mentioned | IGST if IGST mentioned | GST if generic | empty string otherwise."
+)
+
+SYSTEM_PROMPT_CATEGORIZE = (
+    "Input: list of {index, description}. Output: list of {index, category, gst}.\n"
+    "Categories (pick exactly one): "
+    "Salary=payroll/NEFT salary, Food=Zomato/Swiggy/restaurant, "
+    "Fuel=petrol/diesel/HPCL/BPCL, Rent=house rent/PG, "
+    "Utilities=electricity/Jio/Airtel, Shopping=Amazon/Flipkart/Myntra, "
+    "Groceries=Blinkit/Zepto/BigBasket, "
+    "Transfer=UPI/NEFT/RTGS/IMPS/GPay/PhonePe, "
+    "Subscription=Netflix/Spotify/Prime, GST=CGST/SGST/IGST payments, "
+    "Tax=income tax/TDS, Investment=Zerodha/Groww/SIP/MF, "
+    "EMI=loan EMI/home loan/car loan, Refund=refund/cashback/reversal, "
+    "Other=unclassified.\n"
+    "GST field: CGST+SGST | IGST | GST | empty string."
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PDF BASIC CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
 def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
     """
-    Swiftly checks page count and whether the document is text-based by reading just the first two pages.
+    Read first 2 pages only, detect if text-based or scanned.
     Returns (total_pages, is_text_based).
     """
     try:
@@ -65,8 +150,8 @@ def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
         total_pages = len(reader.pages)
         if total_pages == 0:
             return 0, False
-        
-        # Check up to 2 pages to verify it's not just a scanned image
+
+        # Check up to 2 pages for extractable text
         for i in range(min(2, total_pages)):
             text = reader.pages[i].extract_text()
             if text and len(text.strip()) > 20:
@@ -75,10 +160,57 @@ def check_pdf_basic(pdf_path: str, password: str = None) -> Tuple[int, bool]:
     except Exception as e:
         raise e
 
+
+def is_text_quality_sufficient(text: str) -> bool:
+    """
+    Check if extracted text has enough quality for Gemini text-chunk parsing.
+    Returns False if text is garbled, mostly whitespace, or encoding garbage.
+    """
+    if not text or len(text.strip()) < 100:
+        return False
+
+    # Check ratio of printable ASCII + common Unicode to total chars
+    printable_count = 0
+    total = len(text)
+    for ch in text:
+        if ch.isprintable() or ch in ('\n', '\t', '\r'):
+            printable_count += 1
+
+    printable_ratio = printable_count / total if total > 0 else 0
+    if printable_ratio < 0.85:
+        print(f"[TextQuality] Printable ratio too low: {printable_ratio:.2f}")
+        return False
+
+    # Check for presence of date-like patterns (bank statements always have dates)
+    date_matches = re.findall(
+        r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|'
+        r'\d{1,2}\s+[A-Za-z]{3,4}\s+\d{2,4}|'
+        r'\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}',
+        text[:5000]
+    )
+    if len(date_matches) < 2:
+        print(f"[TextQuality] Too few date patterns found: {len(date_matches)}")
+        return False
+
+    # Check for amount-like patterns (digits with optional comma/decimal)
+    amount_matches = re.findall(r'\d{1,3}(?:,\d{2,3})*(?:\.\d{1,2})?', text[:5000])
+    if len(amount_matches) < 3:
+        print(f"[TextQuality] Too few amount patterns found: {len(amount_matches)}")
+        return False
+
+    # Check for garbage sequences (consecutive non-ASCII or control chars)
+    garbage_runs = re.findall(r'[^\x20-\x7E\n\t\r₹]{10,}', text[:5000])
+    if len(garbage_runs) > 5:
+        print(f"[TextQuality] Too many garbage runs: {len(garbage_runs)}")
+        return False
+
+    return True
+
+
 def extract_full_text(pdf_path: str, password: str = None) -> str:
     """
-    Extracts full text from all pages sequentially using pypdf for maximum speed,
-    with a robust fallback to pdfplumber layout-aware text extraction.
+    Extract full text from all pages using pypdf (fast),
+    with fallback to pdfplumber layout-aware extraction.
     """
     try:
         reader = PdfReader(pdf_path, password=password)
@@ -106,7 +238,9 @@ def extract_full_text(pdf_path: str, password: str = None) -> str:
             return ""
 
 
-# ── Native Rule-Based Parser Helpers ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# NATIVE RULE-BASED PARSER
+# ══════════════════════════════════════════════════════════════════════════════
 
 DATE_PATTERNS = [
     re.compile(r'^\s*\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\s*$'),          # 12/05/2023, 12-05-23
@@ -116,7 +250,9 @@ DATE_PATTERNS = [
     re.compile(r'^\s*\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}\s*$'),            # 2023-05-12
 ]
 
+
 def is_valid_date(val: str) -> bool:
+    """Regex check for DD/MM/YYYY, DD-MM-YY, DD Mon YYYY, YYYY-MM-DD etc."""
     if not val:
         return False
     val_str = str(val).strip()
@@ -126,24 +262,39 @@ def is_valid_date(val: str) -> bool:
     return False
 
 
+# ── Local Categorization (FREE — no API calls) ───────────────────────────────
+
 def categorize_locally(description: str) -> str:
+    """Keyword matching for transaction categorization. Returns one category."""
     desc_lower = str(description).lower()
 
     categories = {
         "Salary": ["salary", "payroll", "wage", "direct dep", "neft salary"],
         "Food": ["zomato", "swiggy", "restaurant", "cafe", "food", "dining", "domino", "starbuck"],
         "Fuel": ["petrol", "diesel", "hpcl", "bpcl", "iocl", "fuel", "shell"],
-        "Rent": ["rent", "landlord", "brokerage", "house rent"],
-        "Utilities": ["electricity", "bescom", "tneb", "uppcl", "water", "broadband", "jio", "airtel", "vi ", "recharge", "gas", "indane", "act fibernet"],
+        "Rent": ["rent", "landlord", "brokerage", "house rent", "pg rent"],
+        "Utilities": [
+            "electricity", "bescom", "tneb", "uppcl", "water", "broadband",
+            "jio", "airtel", "vi ", "recharge", "gas", "indane", "act fibernet"
+        ],
         "Shopping": ["amazon", "flipkart", "myntra", "meesho", "clothing", "appliances", "retail"],
-        "Groceries": ["blinkit", "zepto", "instamart", "bigbasket", "supermarket", "grocery", "groceries", "milk", "dairy"],
-        "Transfer": ["upi", "transfer", "neft", "rtgs", "imps", "ft", "sent to", "received from", "gpay", "phonepe"],
-        "Subscription": ["netflix", "prime video", "spotify", "youtube premium", "disney", "hotstar", "microsoft", "google storage", "cloud"],
+        "Groceries": [
+            "blinkit", "zepto", "instamart", "bigbasket", "supermarket",
+            "grocery", "groceries", "milk", "dairy"
+        ],
+        "Transfer": [
+            "upi", "transfer", "neft", "rtgs", "imps", "ft",
+            "sent to", "received from", "gpay", "phonepe"
+        ],
+        "Subscription": [
+            "netflix", "prime video", "spotify", "youtube premium",
+            "disney", "hotstar", "microsoft", "google storage", "cloud"
+        ],
         "GST": ["gst", "cgst", "sgst", "igst", "tax split"],
         "Tax": ["income tax", "tds", "itr", "advance tax", "professional tax"],
         "Investment": ["zerodha", "groww", "mutual fund", "sip", "demat", "shares", "stocks", "etf"],
         "EMI": ["emi", "loan", "mortgage", "hdfc bank loan", "sbi loan", "car emi", "home loan"],
-        "Refund": ["refund", "cashback", "returned", "reversal"]
+        "Refund": ["refund", "cashback", "returned", "reversal"],
     }
 
     for cat, keywords in categories.items():
@@ -154,6 +305,7 @@ def categorize_locally(description: str) -> str:
 
 
 def extract_gst_locally(description: str) -> str:
+    """Returns CGST+SGST / IGST / GST / empty string."""
     desc_lower = str(description).lower()
     if "cgst" in desc_lower and "sgst" in desc_lower:
         return "CGST+SGST"
@@ -164,7 +316,16 @@ def extract_gst_locally(description: str) -> str:
     return ""
 
 
+# ── Header Detection ─────────────────────────────────────────────────────────
+
 def find_header_mapping(row: List[str]) -> Dict[str, int]:
+    """
+    Detect column positions from header row keywords.
+    Date/Dt/Txn Date → date col, Value Date/Val → value_date col,
+    Particulars/Narration/Description/Remarks → description col,
+    Debit/Withdrawal/Dr → debit col, Credit/Deposit/Cr → credit col,
+    Balance/Bal → balance col.
+    """
     mapping = {}
     row_lower = [str(cell).lower().strip() if cell is not None else "" for cell in row]
 
@@ -201,10 +362,12 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
     return {}
 
 
+# ── Line-by-Line Regex Parser ────────────────────────────────────────────────
+
 def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
     """
     Fallback parser that extracts transactions from raw page text line-by-line.
-    Highly robust against borderless table layouts.
+    Handles borderless table layouts common in Indian bank statements.
     """
     transactions = []
     lines = text.split("\n")
@@ -217,6 +380,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
     credit_kws = ["credit", "deposit", "receipt", "cr", "deposit(cr)"]
     balance_kws = ["balance", "bal", "running"]
 
+    # First pass: find the header line and compute column boundaries
     for line in lines:
         line_lower = line.lower()
         if any(kw in line_lower for kw in date_kws) and any(kw in line_lower for kw in desc_kws):
@@ -225,7 +389,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
             for kw in date_kws:
                 idx = line_lower.find(kw)
                 if idx != -1:
-                    if "value" in line_lower[max(0, idx-10):idx+20] or "val" in line_lower[max(0, idx-10):idx+20]:
+                    if "value" in line_lower[max(0, idx - 10):idx + 20] or "val" in line_lower[max(0, idx - 10):idx + 20]:
                         bounds["value_date"] = idx
                     else:
                         bounds["date"] = idx
@@ -268,15 +432,16 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                     col_name, start = sorted_cols[i]
                     col_start = start
                     if i > 0:
-                        prev_name, prev_start = sorted_cols[i-1]
+                        prev_name, prev_start = sorted_cols[i - 1]
                         col_start = (prev_start + col_start) // 2 + 2
                     else:
                         col_start = 0
 
-                    col_end = sorted_cols[i+1][1] if i < len(sorted_cols) - 1 else 300
+                    col_end = sorted_cols[i + 1][1] if i < len(sorted_cols) - 1 else 300
                     header_bounds[col_name] = (col_start, col_end)
                 break
 
+    # Second pass: extract transactions using column boundaries
     for line in lines:
         if not line.strip():
             continue
@@ -319,7 +484,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                     "credit": credit_val,
                     "balance": balance_val,
                     "category": categorize_locally(desc_val),
-                    "gst": extract_gst_locally(desc_val)
+                    "gst": extract_gst_locally(desc_val),
                 })
                 continue
 
@@ -340,6 +505,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                         transactions[-1]["balance"] = balance_val
                 continue
 
+        # Fallback: split by multiple spaces when no header bounds
         parts = re.split(r'\s{2,}', line.strip())
         if not parts:
             continue
@@ -353,7 +519,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 break
 
         if date_val and date_part_idx != -1:
-            remaining = parts[date_part_idx+1:]
+            remaining = parts[date_part_idx + 1:]
             if not remaining:
                 continue
 
@@ -403,10 +569,8 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
             elif len(amounts) == 2:
                 amt = amounts[0]
                 bal = amounts[1]
-
                 desc_lower = desc_val.lower()
                 is_deb = any(kw in desc_lower for kw in ["payment", "upi to", "transfer to", "dr", "debit", "withdrawal"]) or amt.startswith("-")
-
                 if is_deb:
                     debit_val = amt
                 else:
@@ -425,7 +589,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 "credit": credit_val,
                 "balance": balance_val,
                 "category": categorize_locally(desc_val),
-                "gst": extract_gst_locally(desc_val)
+                "gst": extract_gst_locally(desc_val),
             })
 
         elif len(parts) == 1 and transactions:
@@ -437,25 +601,24 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
     return transactions
 
 
+# ── Native pdfplumber Table Parser ────────────────────────────────────────────
+
 def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, Any]]:
     """
-    Extract transactions from structured PDF statements natively using pdfplumber without Gemini.
+    Extract transactions from structured PDF statements natively using pdfplumber.
+    25s timeout, 100 page limit. Includes column-shift repair for borderless tables.
     """
     start_time = time.time()
-    
-    # Check page count first. Large PDFs are bypassed on Vercel to avoid 10s gateway timeouts.
-    # Gemini fallback processes pages in parallel and runs within 4-5s total.
     max_pages = 100
-    
+
     try:
         reader = PdfReader(pdf_path, password=password)
         total_pages = len(reader.pages)
         if total_pages > max_pages:
-            print(f"[Native] PDF has {total_pages} pages (limit: {max_pages} pages). Bypassing native parsing to avoid timeouts.")
+            print(f"[Native] PDF has {total_pages} pages (limit: {max_pages}). Bypassing native parsing.")
             return []
     except Exception as e:
         print(f"[Native] Failed to check page count via pypdf: {e}")
-        # Proceed to try opening with pdfplumber
 
     transactions: List[Dict[str, Any]] = []
     header_mapping: Dict[str, int] = {}
@@ -464,14 +627,15 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
         with pdfplumber.open(pdf_path, password=password) as pdf:
             table_found = False
             for idx, page in enumerate(pdf.pages):
-                # Timeout check to prevent gateway timeouts on Vercel
+                # 25s timeout guard
                 if time.time() - start_time > 25.0:
-                    print(f"[Native] Timeout of 25.0s exceeded at page {idx+1}/{len(pdf.pages)}. Aborting native table parser.")
+                    print(f"[Native] Timeout of 25s exceeded at page {idx + 1}/{len(pdf.pages)}. Aborting.")
                     return []
 
                 if idx >= 2 and not table_found:
-                    print("[Native] No tables found in first 2 pages. Aborting table extraction for speed.")
+                    print("[Native] No tables found in first 2 pages. Aborting table extraction.")
                     break
+
                 tables = page.extract_tables()
                 if not tables:
                     try:
@@ -518,8 +682,11 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                             balance_val = clean_row[balance_idx] if balance_idx is not None and balance_idx < len(clean_row) else ""
                             val_date_val = clean_row[val_date_idx] if val_date_idx is not None and val_date_idx < len(clean_row) else ""
 
-                            # Repair column shift caused by missing Value Date column in borderless tables
-                            if val_date_idx is not None and val_date_val and len(val_date_val) > 11 and not is_valid_date(val_date_val) and re.search(r'[A-Za-z]{2,}', val_date_val):
+                            # Repair column shift: when value_date col has text instead of date (borderless tables)
+                            if (val_date_idx is not None and val_date_val
+                                    and len(val_date_val) > 11
+                                    and not is_valid_date(val_date_val)
+                                    and re.search(r'[A-Za-z]{2,}', val_date_val)):
                                 balance_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
                                 credit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
                                 debit_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
@@ -531,7 +698,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                 desc_val += " " + debit_val
                                 debit_val = credit_val
                                 credit_val = balance_val
-                                balance_val = clean_row[balance_idx+1] if balance_idx is not None and balance_idx+1 < len(clean_row) else ""
+                                balance_val = clean_row[balance_idx + 1] if balance_idx is not None and balance_idx + 1 < len(clean_row) else ""
 
                             txn = {
                                 "date": date_val,
@@ -541,7 +708,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                 "credit": credit_val,
                                 "balance": balance_val,
                                 "category": categorize_locally(desc_val),
-                                "gst": extract_gst_locally(desc_val)
+                                "gst": extract_gst_locally(desc_val),
                             }
                             transactions.append(txn)
 
@@ -560,8 +727,9 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
 
                 page.flush_cache()
 
+        # If table extraction yielded nothing, try line-by-line regex fallback
         if not transactions:
-            print("[Native] No transactions found using table extraction. Trying line-by-line regex parser fallback...")
+            print("[Native] No transactions from table extraction. Trying line-by-line regex fallback...")
             full_text_list = []
             with pdfplumber.open(pdf_path, password=password) as pdf:
                 for page in pdf.pages:
@@ -579,96 +747,28 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     return transactions
 
 
-def _build_system_prompt(categorize: bool, gst: bool) -> str:
-    """
-    Build a comprehensive system prompt for accurate bank statement parsing.
-    Works across all major Indian banks (SBI, HDFC, ICICI, Axis, Kotak, PNB, BOB,
-    Canara, IDFC, Yes Bank, IndusInd) and international formats.
-    """
-    prompt = (
-        "You are a world-class bank statement parser with deep expertise in Indian "
-        "and international bank statement formats. Your sole job is to extract EVERY "
-        "transaction from the provided bank statement text with 100% accuracy.\n\n"
-        "=== CRITICAL RULES ===\n"
-        "- NEVER skip a transaction. Even partial or unclear rows must be included.\n"
-        "- NEVER hallucinate data. Only extract information explicitly present.\n"
-        "- NEVER merge two separate transactions into one.\n"
-        "- Process transactions in chronological order, exactly as they appear.\n"
-        "- Tab-separated rows indicate structured table data — treat each tab as a column separator.\n\n"
-        "=== FIELD EXTRACTION RULES ===\n"
-        "1. DATE: Extract EXACTLY as shown in the statement (e.g., '01/05/2024', '01-May-24', '1 May 2024').\n"
-        "   - Do NOT reformat or convert the date.\n"
-        "   - Column headers may say: Date, Txn Date, Transaction Date, Posting Date, Value Date, Dt.\n\n"
-        "2. VALUE_DATE: The clearing/value date if listed in a separate column (e.g., 'Value Dt', 'Val Date').\n"
-        "   - If no separate value date column exists, copy the transaction date.\n\n"
-        "3. DESCRIPTION: The full transaction narrative/particulars.\n"
-        "   - Column headers may say: Particulars, Narration, Description, Remarks, Transaction Details, Chq/Ref No.\n"
-        "   - If the description spans multiple lines, concatenate them with a space.\n"
-        "   - Include UPI IDs, reference numbers, merchant names, and all visible details.\n\n"
-        "4. DEBIT: Any withdrawal, payment, or outflow (money leaving the account).\n"
-        "   - Column headers: Debit, Withdrawal, Dr, Payment, Dr Amount, Withdrawal(Dr).\n"
-        "   - Normalize: Remove ₹, Rs., INR, USD, commas. Remove 'Dr'/'Cr' suffix from amounts.\n"
-        "   - If empty/nil/-, set to empty string ''.\n\n"
-        "5. CREDIT: Any deposit, receipt, or inflow (money entering the account).\n"
-        "   - Column headers: Credit, Deposit, Cr, Receipt, Cr Amount, Deposit(Cr).\n"
-        "   - Same normalization as debit.\n"
-        "   - If empty/nil/-, set to empty string ''.\n\n"
-        "6. BALANCE: Running balance after the transaction.\n"
-        "   - Column headers: Balance, Bal, Running Balance, Closing Balance.\n"
-        "   - If not present in the statement, set to empty string ''.\n\n"
-        "=== BANK-SPECIFIC NOTES ===\n"
-        "- SBI: Columns are typically Txn Date, Value Date, Description, Ref No/Cheque No, Debit, Credit, Balance.\n"
-        "- HDFC: Columns are Date, Narration, Value Dt, Chq/Ref No, Withdrawal Amt, Deposit Amt, Closing Balance.\n"
-        "- ICICI: Columns are Transaction Date, Value Date, Particulars, Cheque No, Deposits, Withdrawals, Balance.\n"
-        "- Axis: Columns are Tran Date, Chq No, Particulars, Debit, Credit, Balance.\n"
-        "- Kotak: Columns are Date, Description, Chq/Ref No, Debit, Credit, Balance.\n"
-        "- IDFC/IndusInd/Yes Bank: May use compact formats with Dr/Cr column style.\n\n"
-        "=== WHAT TO SKIP ===\n"
-        "- Header rows (containing column names)\n"
-        "- Footer rows (totals, page numbers, bank addresses)\n"
-        "- Opening Balance / Closing Balance summary lines\n"
-        "- Blank rows\n\n"
-    )
+# ══════════════════════════════════════════════════════════════════════════════
+# GEMINI AI PARSING
+# ══════════════════════════════════════════════════════════════════════════════
 
+def _get_system_prompt(categorize: bool, gst: bool) -> str:
+    """Select the appropriate minimal system prompt based on flags."""
     if categorize:
-        prompt += (
-            "=== CATEGORY ASSIGNMENT ===\n"
-            "Assign exactly ONE category per transaction from this list ONLY:\n"
-            "Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, "
-            "Subscription, GST, Tax, Investment, EMI, Refund, Other\n"
-            "Rules:\n"
-            "- Salary: NEFT salary credits, payroll, ECS salary\n"
-            "- Food: Zomato, Swiggy, Dunzo, restaurants, cafes, dining\n"
-            "- Fuel: Petrol, diesel, HPCL, BPCL, IOCL, Shell, HP, BP\n"
-            "- Rent: House rent, flat rent, PG rent, accommodation\n"
-            "- Utilities: Electricity (BESCOM/TNEB/UPPCL), water, gas, Jio, Airtel, Vi, broadband\n"
-            "- Shopping: Amazon, Flipkart, Myntra, Meesho, retail stores, clothing\n"
-            "- Groceries: Blinkit, Zepto, BigBasket, Dunzo grocery, supermarket, dairy\n"
-            "- Transfer: UPI, NEFT, RTGS, IMPS, inter-account transfer, GPay, PhonePe, Paytm\n"
-            "- Subscription: Netflix, Spotify, Amazon Prime, YouTube Premium, Disney+, Microsoft\n"
-            "- GST: GST payment, CGST, SGST, IGST entries\n"
-            "- Tax: Income tax, TDS, advance tax, professional tax\n"
-            "- Investment: Zerodha, Groww, Kuvera, SIP, mutual fund, demat, stocks\n"
-            "- EMI: Loan EMI, car EMI, home loan EMI, personal loan repayment\n"
-            "- Refund: Refund, cashback, reversal, returned\n"
-            "- Other: All unclassified transactions\n\n"
-        )
+        return SYSTEM_PROMPT_WITH_CATEGORIES
     else:
-        prompt += "=== CATEGORY ===\nSet category to 'Other' for every row.\n\n"
+        return SYSTEM_PROMPT_PARSE_ONLY
 
-    if gst:
-        prompt += (
-            "=== GST FIELD ===\n"
-            "If the transaction description explicitly mentions GST components, set:\n"
-            "- 'CGST+SGST' if both Central and State GST are mentioned\n"
-            "- 'IGST' if Integrated GST is mentioned\n"
-            "- 'GST' if only generic GST is mentioned\n"
-            "- '' (empty) for all other transactions\n"
-        )
-    else:
-        prompt += "=== GST FIELD ===\nSet gst to '' (empty string) for all rows.\n"
 
-    return prompt
+def _strip_markdown_fences(raw: str) -> str:
+    """Clean up potential markdown code fence wrapping from Gemini response."""
+    raw = raw.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    return raw.strip()
 
 
 def _call_gemini_chunk(
@@ -676,17 +776,18 @@ def _call_gemini_chunk(
     system_prompt: str,
     text_chunk: str,
     chunk_num: int = 1,
-    chunk_context: str = ""
+    chunk_context: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Call Gemini with a single chunk of text, with retry + exponential backoff.
-    Supports both new google.genai and legacy google.generativeai SDK.
+    Max 5 retries. Rate limit (429/quota): sleep 10s then retry.
+    Billing/permission errors: raise immediately, do not retry.
     """
     user_message = (
         f"Extract ALL transactions from this bank statement text. "
         f"Return every transaction row, do not skip any.\n"
         f"{chunk_context}\n"
-        f"BANK STATEMENT TEXT:\n{'='*60}\n{text_chunk}\n{'='*60}"
+        f"BANK STATEMENT TEXT:\n{'=' * 60}\n{text_chunk}\n{'=' * 60}"
     )
 
     max_retries = 5
@@ -701,10 +802,9 @@ def _call_gemini_chunk(
                         system_instruction=system_prompt,
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
-                        temperature=0,  # 0 = deterministic, max accuracy
-                    )
+                        temperature=0,
+                    ),
                 )
-                raw = response.text
             else:
                 model = model_or_client
                 response = model.generate_content(
@@ -713,31 +813,31 @@ def _call_gemini_chunk(
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
                         temperature=0,
-                    )
+                    ),
                 )
-            raw = response.text
-            # Clean up potential markdown formatting
-            raw = raw.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.startswith("```"):
-                raw = raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
 
+            raw = _strip_markdown_fences(response.text)
             data = json.loads(raw)
             txns = data.get("transactions", [])
             print(f"  Chunk {chunk_num}: Extracted {len(txns)} transactions")
             return txns
         except Exception as e:
-            print(f"  Chunk {chunk_num} attempt {attempt+1} failed: {e}")
             err_msg = str(e).lower()
+
+            # Billing/permission errors: raise immediately
+            if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                print(f"  Chunk {chunk_num} billing/permission error: {e}")
+                raise
+
+            print(f"  Chunk {chunk_num} attempt {attempt + 1} failed: {e}")
+
             if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "limit" in err_msg:
-                print(f"Rate limit / Quota hit on chunk {chunk_num}. Waiting longer before retry...")
-                time.sleep(8) # Force a longer sleep for rate limits
+                print(f"Rate limit hit on chunk {chunk_num}. Sleeping 10s before retry...")
+                time.sleep(10)
+
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s, 8s
+                backoff = min(2 ** attempt, 8)  # 1s, 2s, 4s, 8s
+                time.sleep(backoff)
             else:
                 raise
     return []
@@ -745,15 +845,14 @@ def _call_gemini_chunk(
 
 def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Remove exact duplicate transaction rows that may appear when chunks overlap.
-    Uses a fingerprint of (date, description, debit, credit, balance).
+    Remove exact duplicate transaction rows using MD5 fingerprint
+    of date + description + debit + credit + balance.
     """
     seen = set()
     result = []
     for txn in txns:
-        # Build a stable fingerprint
         key = hashlib.md5(
-            f"{txn.get('date','')}__{txn.get('description','')}__{txn.get('debit','')}__{txn.get('credit','')}__{txn.get('balance','')}".encode()
+            f"{txn.get('date', '')}__{txn.get('description', '')}__{txn.get('debit', '')}__{txn.get('credit', '')}__{txn.get('balance', '')}".encode()
         ).hexdigest()
         if key not in seen:
             seen.add(key)
@@ -764,16 +863,21 @@ def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return result
 
 
-def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> List[Dict[str, Any]]:
+def parse_with_gemini(
+    text: str,
+    categorize: bool = False,
+    gst: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Send statement text to Google Gemini and get parsed transactions in structured JSON.
-    Handles large statements by splitting into chunks and merging results IN PARALLEL.
-    Uses a comprehensive, bank-specific prompt for 100% accuracy.
+    Send statement text to Gemini and get parsed transactions.
+    Handles large statements by splitting into 200K-char chunks.
+    Returns (transactions_list, gemini_calls_count).
     """
     if not GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY environment variable is not configured.")
 
-    system_prompt = _build_system_prompt(categorize, gst)
+    system_prompt = _get_system_prompt(categorize, gst)
+    gemini_calls = 0
 
     if GENAI_NEW_SDK:
         model_or_client = genai.Client(api_key=GEMINI_API_KEY)
@@ -782,22 +886,22 @@ def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> L
         genai.configure(api_key=GEMINI_API_KEY)
         model_or_client = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
-            system_instruction=system_prompt
+            system_instruction=system_prompt,
         )
-        print("Using legacy google.generativeai SDK (consider upgrading)")
+        print("Using legacy google.generativeai SDK")
 
     all_transactions = []
 
     if len(text) <= GEMINI_CHUNK_SIZE:
         # Single call for normal-sized statements
         all_transactions = _call_gemini_chunk(model_or_client, system_prompt, text, chunk_num=1)
+        gemini_calls = 1
     else:
-        # Multi-chunk approach: split by page breaks first, then by size
-        print(f"Large statement ({len(text)} chars), splitting into parallel chunks...")
+        # Multi-chunk: split by page breaks, then by size
+        print(f"Large statement ({len(text)} chars), splitting into chunks of {GEMINI_CHUNK_SIZE}...")
         pages = text.split("\n\n--- Page Break ---\n\n")
 
-        # Build chunk list
-        chunks: List[Tuple[int, str]] = []  # (chunk_num, text)
+        chunks: List[Tuple[int, str]] = []
         current_chunk = ""
         chunk_num = 1
 
@@ -813,28 +917,23 @@ def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> L
             chunks.append((chunk_num, current_chunk))
 
         total_chunks = len(chunks)
-        print(f"  Processing {total_chunks} chunks sequentially to respect rate limits...")
-
-        chunk_results: Dict[int, List[Dict[str, Any]]] = {}
+        print(f"  Processing {total_chunks} chunks sequentially...")
 
         for c_num, chunk_text in chunks:
             if c_num > 1:
-                # 2-second safety delay between chunks to stay under 15 RPM
+                # 2s delay between chunks for rate-limit safety
                 time.sleep(2.0)
-            
+
             print(f"  Processing chunk {c_num} of {total_chunks}...")
             txns = _call_gemini_chunk(
                 model_or_client,
                 system_prompt,
                 chunk_text,
                 c_num,
-                f"(Chunk {c_num} of {total_chunks} — process only the transactions in this section)"
+                f"(Chunk {c_num} of {total_chunks} — process only transactions in this section)",
             )
-            chunk_results[c_num] = txns
-
-        # Merge in order
-        for c_num in sorted(chunk_results.keys()):
-            all_transactions.extend(chunk_results[c_num])
+            all_transactions.extend(txns)
+            gemini_calls += 1
 
     # Normalize output
     result = []
@@ -842,50 +941,175 @@ def parse_with_gemini(text: str, categorize: bool = True, gst: bool = True) -> L
         if isinstance(txn, dict):
             result.append(txn)
         else:
-            result.append(txn.model_dump() if hasattr(txn, 'model_dump') else dict(txn))
+            result.append(txn.model_dump() if hasattr(txn, "model_dump") else dict(txn))
 
-    # Deduplicate (catches cross-chunk overlapping transactions)
+    # Deduplicate cross-chunk overlaps
     result = _deduplicate_transactions(result)
 
-    print(f"Gemini total extracted: {len(result)} transactions")
-    return result
+    print(f"Gemini total extracted: {len(result)} transactions ({gemini_calls} API calls)")
+    return result, gemini_calls
 
+
+# ── Gemini File API (for scanned PDFs and poor-quality text) ──────────────────
+
+def parse_file_directly_with_gemini(
+    file_path: str,
+    mime_type: str,
+    categorize: bool = False,
+    gst: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Uploads a file (scanned PDF or image) to Gemini File API,
+    parses with Gemini 2.5 Flash, returns (transactions, gemini_calls).
+    Cleans up uploaded file in finally block always.
+    """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
+
+    system_prompt = _get_system_prompt(categorize, gst)
+    user_message = (
+        "Extract ALL transactions from this bank statement document/image. "
+        "Return every transaction row, do not skip any."
+    )
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        uploaded_file = None
+        try:
+            if GENAI_NEW_SDK:
+                client = genai.Client(api_key=GEMINI_API_KEY)
+                print(f"[Gemini File API] Uploading: {file_path} (type: {mime_type})")
+                uploaded_file = client.files.upload(file=file_path)
+
+                # Wait for processing (PDFs need server-side processing)
+                if mime_type == "application/pdf":
+                    state_str = str(uploaded_file.state).upper()
+                    wait_time = 0
+                    while "PROCESSING" in state_str and wait_time < 30:
+                        print("Waiting for PDF processing in Files API...")
+                        time.sleep(2)
+                        wait_time += 2
+                        uploaded_file = client.files.get(name=uploaded_file.name)
+                        state_str = str(uploaded_file.state).upper()
+
+                    if "ACTIVE" not in state_str:
+                        raise Exception(f"File state is {state_str}, cannot process.")
+
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[uploaded_file, user_message],
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=system_prompt,
+                        response_mime_type="application/json",
+                        response_schema=TransactionsList,
+                        temperature=0,
+                    ),
+                )
+                raw = response.text
+            else:
+                genai.configure(api_key=GEMINI_API_KEY)
+                model = genai.GenerativeModel(
+                    model_name="gemini-2.5-flash",
+                    system_instruction=system_prompt,
+                )
+                print(f"[Gemini File API] Uploading (legacy): {file_path} (type: {mime_type})")
+                uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
+
+                if mime_type == "application/pdf":
+                    state_str = str(uploaded_file.state).upper()
+                    wait_time = 0
+                    while "PROCESSING" in state_str and wait_time < 30:
+                        print("Waiting for PDF processing in legacy Files API...")
+                        time.sleep(2)
+                        wait_time += 2
+                        uploaded_file = genai.get_file(uploaded_file.name)
+                        state_str = str(uploaded_file.state).upper()
+
+                    if "ACTIVE" not in state_str:
+                        raise Exception(f"File state is {state_str}, cannot process.")
+
+                response = model.generate_content(
+                    contents=[uploaded_file, user_message],
+                    generation_config=genai.GenerationConfig(
+                        response_mime_type="application/json",
+                        response_schema=TransactionsList,
+                        temperature=0,
+                    ),
+                )
+                raw = response.text
+
+            raw = _strip_markdown_fences(raw)
+            data = json.loads(raw)
+            txns = data.get("transactions", [])
+
+            # Normalize
+            result = []
+            for txn in txns:
+                if isinstance(txn, dict):
+                    result.append(txn)
+                else:
+                    result.append(txn.model_dump() if hasattr(txn, "model_dump") else dict(txn))
+
+            print(f"[Gemini File API] Extracted {len(result)} transactions")
+            return result, 1
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            # Billing/permission errors: raise immediately, do not retry
+            if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                raise
+
+            print(f"[Gemini File API] Attempt {attempt + 1} failed: {e}")
+            if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
+                time.sleep(10)
+            if attempt < max_retries - 1:
+                backoff = min(2 ** attempt, 8)
+                time.sleep(backoff)
+            else:
+                raise
+        finally:
+            # Always cleanup uploaded file
+            if uploaded_file:
+                try:
+                    if GENAI_NEW_SDK:
+                        cleanup_client = genai.Client(api_key=GEMINI_API_KEY)
+                        cleanup_client.files.delete(name=uploaded_file.name)
+                    else:
+                        uploaded_file.delete()
+                    print("[Gemini File API] Cleaned up uploaded file")
+                except Exception as ex:
+                    print(f"[Gemini File API] Cleanup failed: {ex}")
+
+    return [], 0
+
+
+# ── Gemini Categorization (post-parse enrichment) ────────────────────────────
 
 def categorize_and_tag_with_gemini(
     transactions: List[Dict[str, Any]],
     categorize: bool = True,
-    gst: bool = True
-) -> List[Dict[str, Any]]:
+    gst: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Categorize transactions and tag GST using Gemini 2.0 Flash in batches.
-    Falls back to local rules defensively if the API call fails.
+    Categorize transactions and tag GST using Gemini 2.5 Flash in batches.
+    Falls back to local rules if API call fails.
+    Returns (transactions, gemini_calls).
     """
     if not transactions:
-        return []
+        return [], 0
     if not GEMINI_API_KEY:
         print("[Gemini] API Key not set, using local rule-based categories.")
-        return transactions
+        return transactions, 0
 
-    system_prompt = (
-        "You are a highly accurate financial transactions categorizer. Your task is to assign a category "
-        "and detect GST for each transaction description provided.\n\n"
-        "Categories to choose from:\n"
-        "Salary, Food, Fuel, Rent, Utilities, Shopping, Groceries, Transfer, Subscription, GST, Tax, Investment, EMI, Refund, Other\n\n"
-        "GST detection:\n"
-        "- 'CGST+SGST' if description mentions CGST and SGST\n"
-        "- 'IGST' if IGST is mentioned\n"
-        "- 'GST' if generic GST is mentioned\n"
-        "- '' (empty string) if no GST is mentioned\n\n"
-        "Ensure you return a list of objects containing the index of the transaction, the category, and the gst value."
-    )
+    system_prompt = SYSTEM_PROMPT_CATEGORIZE
 
-    # Prepare input list: only send index and description to minimize token usage
+    # Prepare input: only index + description to minimize token usage
     input_items = [{"index": idx, "description": txn.get("description", "")} for idx, txn in enumerate(transactions)]
 
-    # Split into chunks of 150 to stay well within limits
+    # Split into chunks of 150 descriptions
     chunk_size = 150
     chunks = [input_items[i:i + chunk_size] for i in range(0, len(input_items), chunk_size)]
-    
+
     if GENAI_NEW_SDK:
         client = genai.Client(api_key=GEMINI_API_KEY)
     else:
@@ -893,9 +1117,10 @@ def categorize_and_tag_with_gemini(
         model = genai.GenerativeModel(model_name="gemini-2.5-flash")
 
     categorized_items = {}
+    gemini_calls = 0
 
     for c_idx, chunk in enumerate(chunks):
-        user_message = f"Process this chunk of transactions:\n{json.dumps(chunk)}"
+        user_message = f"Categorize these transactions:\n{json.dumps(chunk)}"
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -908,7 +1133,7 @@ def categorize_and_tag_with_gemini(
                             response_mime_type="application/json",
                             response_schema=CategorizationList,
                             temperature=0,
-                        )
+                        ),
                     )
                     raw = response.text
                 else:
@@ -918,39 +1143,39 @@ def categorize_and_tag_with_gemini(
                             response_mime_type="application/json",
                             response_schema=CategorizationList,
                             temperature=0,
-                        )
+                        ),
                     )
                     raw = response.text
-                
-                raw = raw.strip()
-                if raw.startswith("```json"):
-                    raw = raw[7:]
-                if raw.startswith("```"):
-                    raw = raw[3:]
-                if raw.endswith("```"):
-                    raw = raw[:-3]
-                raw = raw.strip()
-                
+
+                raw = _strip_markdown_fences(raw)
                 data = json.loads(raw)
                 for item in data.get("items", []):
                     idx = item.get("index")
                     if idx is not None:
                         categorized_items[int(idx)] = {
                             "category": item.get("category", "Other") if categorize else "Other",
-                            "gst": item.get("gst", "") if gst else ""
+                            "gst": item.get("gst", "") if gst else "",
                         }
+                gemini_calls += 1
                 break  # Success
             except Exception as e:
-                print(f"[Gemini Categorize] Chunk {c_idx+1} attempt {attempt+1} failed: {e}")
+                err_msg = str(e).lower()
+                if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                    raise
+
+                print(f"[Gemini Categorize] Chunk {c_idx + 1} attempt {attempt + 1} failed: {e}")
+                if "429" in err_msg or "quota" in err_msg:
+                    time.sleep(10)
                 if attempt < max_retries - 1:
                     time.sleep(2 ** attempt)
                 else:
-                    print(f"[Gemini Categorize] Falling back to local rules for chunk {c_idx+1}")
+                    # Fall back to local rules for this chunk
+                    print(f"[Gemini Categorize] Falling back to local rules for chunk {c_idx + 1}")
                     for item in chunk:
-                        idx = item["index"]
-                        categorized_items[idx] = {
-                            "category": transactions[idx].get("category", "Other"),
-                            "gst": transactions[idx].get("gst", "")
+                        idx_val = item["index"]
+                        categorized_items[idx_val] = {
+                            "category": transactions[idx_val].get("category", "Other"),
+                            "gst": transactions[idx_val].get("gst", ""),
                         }
 
     # Merge back into transactions
@@ -960,25 +1185,27 @@ def categorize_and_tag_with_gemini(
             txn["category"] = cat_info["category"]
             txn["gst"] = cat_info["gst"]
 
-    return transactions
+    return transactions, gemini_calls
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OUTPUT FORMATTERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str = "DD/MM/YYYY") -> List[Dict[str, Any]]:
     """
-    Use pandas to standardize data formats, clean amounts, and sort.
+    pandas DataFrame cleanup: strip currency symbols, strip Dr/Cr suffixes,
+    fill NaN with empty string.
     """
     if not txns:
         return []
 
     df = pd.DataFrame(txns)
-
-    # Fill NaN values with empty strings
     df = df.fillna("")
 
     # Strip whitespace from string columns
     for col in df.columns:
-        if df[col].dtype == 'object':
+        if df[col].dtype == "object":
             df[col] = df[col].astype(str).str.strip()
 
     def clean_amount(val):
@@ -990,7 +1217,7 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
         cleaned = re.sub(r'(?i)\s*(dr|cr)\s*$', '', cleaned)
         # Keep only digits, decimal point, comma (thousands sep), and leading minus
         cleaned = re.sub(r'[^\d\.,\-]', '', cleaned)
-        # Collapse multiple dots/commas
+        # Collapse multiple dots
         if cleaned.count('.') > 1:
             parts = cleaned.split('.')
             cleaned = '.'.join([parts[0].replace(',', ''), parts[-1]])
@@ -1008,7 +1235,8 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
 
 def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
     """
-    Create a highly styled, professional Excel worksheet from transactions list using pandas and openpyxl.
+    Styled openpyxl Excel with purple (#4F46E5) header,
+    zebra rows, auto column width, right-aligned amounts with #,##0.00 format.
     """
     if not txns:
         return
@@ -1027,7 +1255,7 @@ def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
         "credit": "Credit",
         "balance": "Balance",
         "category": "Category",
-        "gst": "GST"
+        "gst": "GST",
     }
     df = df.rename(columns=rename_dict)
 
@@ -1081,6 +1309,7 @@ def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
                 else:
                     cell.alignment = Alignment(horizontal="left", vertical="center")
 
+        # Auto column width
         for col in worksheet.columns:
             max_len = 0
             col_letter = get_column_letter(col[0].column)
@@ -1096,146 +1325,166 @@ def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
 
 
 def generate_csv_file(txns: List[Dict[str, Any]], file_path: str):
-    """
-    Generate standard CSV file from transactions.
-    """
+    """Generate CSV with utf-8-sig encoding for Excel compatibility."""
     if not txns:
         return
     df = pd.DataFrame(txns)
     cols = ["date", "value_date", "description", "debit", "credit", "balance", "category", "gst"]
     cols = [c for c in cols if c in df.columns]
     df = df[cols]
-    df.to_csv(file_path, index=False, encoding='utf-8-sig')  # utf-8-sig for Excel compat
+    df.to_csv(file_path, index=False, encoding='utf-8-sig')
 
 
-def parse_file_directly_with_gemini(
-    file_path: str,
-    mime_type: str,
+# ══════════════════════════════════════════════════════════════════════════════
+# MASTER FUNCTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_bank_statement_smart(
+    pdf_path: str,
+    password: str = None,
     categorize: bool = True,
-    gst: bool = True
-) -> List[Dict[str, Any]]:
+    gst: bool = True,
+    use_gemini_categorize: bool = False,
+) -> Dict[str, Any]:
     """
-    Uploads a file (scanned PDF or image screenshot) to Gemini Files API,
-    parses it using Gemini 2.5 Flash, and returns structured transactions.
+    Master parsing function with the hybrid flow:
+
+    1. check_pdf_basic() — read first 2 pages only, detect text vs scanned
+    2. SCANNED → Gemini File API directly (1 API call, handles OCR)
+    3. TEXT-BASED → native pdfplumber table extraction (0 API calls)
+    4. Native fails → line-by-line regex parser (0 API calls)
+    5. Native < 5 txns → is_text_quality_sufficient()
+    6. Quality OK → Gemini text chunks (1-2 API calls)
+    7. Quality poor → Gemini File API (1 API call)
+
+    Args:
+        pdf_path: Path to the PDF file
+        password: PDF password if encrypted
+        categorize: Whether to categorize transactions (True by default)
+        gst: Whether to extract GST info (True by default)
+        use_gemini_categorize: Use Gemini for categorization (False by default, uses local rules)
+
+    Returns:
+        {
+            transactions: [...],
+            method: "native" | "gemini_text" | "gemini_file",
+            count: int,
+            gemini_calls: int,
+        }
     """
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
+    overall_start = time.time()
+    gemini_calls = 0
+    method = "native"
 
-    system_prompt = _build_system_prompt(categorize, gst)
-    user_message = (
-        "Extract ALL transactions from this bank statement document/image. "
-        "Return every transaction row, do not skip any."
-    )
+    # ── Step 1: Basic PDF check ──
+    print(f"\n{'=' * 60}")
+    print(f"[Smart Parse] Starting: {pdf_path}")
+    print(f"{'=' * 60}")
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        uploaded_file = None
-        try:
-            if GENAI_NEW_SDK:
-                client = genai.Client(api_key=GEMINI_API_KEY)
-                print(f"[Gemini Direct] Uploading file to Files API: {file_path} (type: {mime_type})")
-                uploaded_file = client.files.upload(file=file_path)
-                
-                # Wait for the file to be processed if it's a PDF (images are active immediately)
-                if mime_type == "application/pdf":
-                    state_str = str(uploaded_file.state).upper()
-                    wait_time = 0
-                    while "PROCESSING" in state_str and wait_time < 30:
-                        print("Waiting for PDF to be processed in Files API...")
-                        time.sleep(2)
-                        wait_time += 2
-                        uploaded_file = client.files.get(name=uploaded_file.name)
-                        state_str = str(uploaded_file.state).upper()
-                    
-                    if "ACTIVE" not in state_str:
-                        raise Exception(f"File state is {state_str}, cannot process.")
-                
-                response = client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[uploaded_file, user_message],
-                    config=genai_types.GenerateContentConfig(
-                        system_instruction=system_prompt,
-                        response_mime_type="application/json",
-                        response_schema=TransactionsList,
-                        temperature=0,
-                    )
+    total_pages, is_text_based = check_pdf_basic(pdf_path, password)
+    print(f"[Smart Parse] Pages: {total_pages}, Text-based: {is_text_based}")
+
+    if total_pages == 0:
+        elapsed = time.time() - overall_start
+        print(f"[Smart Parse] Empty PDF. Time: {elapsed:.2f}s")
+        return {"transactions": [], "method": "native", "count": 0, "gemini_calls": 0}
+
+    transactions = []
+
+    # ── Step 2: SCANNED → Gemini File API directly ──
+    if not is_text_based:
+        print("[Smart Parse] Scanned PDF detected → Gemini File API (OCR)")
+        method = "gemini_file"
+        transactions, g_calls = parse_file_directly_with_gemini(
+            pdf_path,
+            "application/pdf",
+            categorize=(categorize and use_gemini_categorize),
+            gst=gst,
+        )
+        gemini_calls += g_calls
+
+    else:
+        # ── Step 3: TEXT-BASED → try native pdfplumber table extraction ──
+        print("[Smart Parse] Text-based PDF → trying native pdfplumber extraction...")
+        native_start = time.time()
+        transactions = parse_pdf_natively(pdf_path, password)
+        native_elapsed = time.time() - native_start
+        print(f"[Smart Parse] Native extraction: {len(transactions)} txns in {native_elapsed:.2f}s")
+
+        # ── Step 4: Native table parse fails → try line-by-line regex ──
+        if not transactions:
+            print("[Smart Parse] Native table extraction failed → trying line-by-line regex...")
+            try:
+                full_text = extract_full_text(pdf_path, password)
+                transactions = parse_line_by_line(full_text)
+                print(f"[Smart Parse] Line-by-line regex: {len(transactions)} txns")
+            except Exception as e:
+                print(f"[Smart Parse] Line-by-line regex failed: {e}")
+
+        # ── Step 5: Native gets < 5 transactions → check text quality ──
+        if len(transactions) < 5:
+            print(f"[Smart Parse] Only {len(transactions)} native txns (< 5) → checking text quality...")
+
+            full_text = extract_full_text(pdf_path, password)
+
+            # ── Step 6: Text quality OK → Gemini text chunks ──
+            if is_text_quality_sufficient(full_text):
+                print("[Smart Parse] Text quality OK → Gemini text chunks")
+                method = "gemini_text"
+                transactions, g_calls = parse_with_gemini(
+                    full_text,
+                    categorize=(categorize and use_gemini_categorize),
+                    gst=gst,
                 )
-                raw = response.text
+                gemini_calls += g_calls
             else:
-                genai.configure(api_key=GEMINI_API_KEY)
-                model = genai.GenerativeModel(
-                    model_name="gemini-2.5-flash",
-                    system_instruction=system_prompt
+                # ── Step 7: Text quality poor → Gemini File API ──
+                print("[Smart Parse] Text quality poor → Gemini File API")
+                method = "gemini_file"
+                transactions, g_calls = parse_file_directly_with_gemini(
+                    pdf_path,
+                    "application/pdf",
+                    categorize=(categorize and use_gemini_categorize),
+                    gst=gst,
                 )
-                print(f"[Gemini Direct] Uploading file to legacy Files API: {file_path} (type: {mime_type})")
-                uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
-                
-                if mime_type == "application/pdf":
-                    state_str = str(uploaded_file.state).upper()
-                    wait_time = 0
-                    while "PROCESSING" in state_str and wait_time < 30:
-                        print("Waiting for PDF to be processed in legacy Files API...")
-                        time.sleep(2)
-                        wait_time += 2
-                        uploaded_file = genai.get_file(uploaded_file.name)
-                        state_str = str(uploaded_file.state).upper()
-                    
-                    if "ACTIVE" not in state_str:
-                        raise Exception(f"File state is {state_str}, cannot process.")
+                gemini_calls += g_calls
 
-                response = model.generate_content(
-                    contents=[uploaded_file, user_message],
-                    generation_config=genai.GenerationConfig(
-                        response_mime_type="application/json",
-                        response_schema=TransactionsList,
-                        temperature=0,
-                    )
-                )
-                raw = response.text
-
-            # Clean up potential markdown formatting
-            raw = raw.strip()
-            if raw.startswith("```json"):
-                raw = raw[7:]
-            if raw.startswith("```"):
-                raw = raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-
-            data = json.loads(raw)
-            txns = data.get("transactions", [])
-            
-            # Normalize list items to dict
-            result = []
-            for txn in txns:
-                if isinstance(txn, dict):
-                    result.append(txn)
-                else:
-                    result.append(txn.model_dump() if hasattr(txn, 'model_dump') else dict(txn))
-
-            print(f"[Gemini Direct] [OK] Successfully extracted {len(result)} transactions")
-            return result
-
-        except Exception as e:
-            print(f"[Gemini Direct] Attempt {attempt+1} failed: {e}")
-            err_msg = str(e).lower()
-            if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
-                raise
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
+    # ── Local categorization (FREE, default) ──
+    if categorize and not use_gemini_categorize:
+        # Apply local rule-based categorization
+        for txn in transactions:
+            desc = txn.get("description", "")
+            txn["category"] = categorize_locally(desc)
+            if gst:
+                txn["gst"] = extract_gst_locally(desc)
             else:
-                raise
-        finally:
-            if uploaded_file:
-                try:
-                    if GENAI_NEW_SDK:
-                        client = genai.Client(api_key=GEMINI_API_KEY)
-                        client.files.delete(name=uploaded_file.name)
-                    else:
-                        uploaded_file.delete()
-                    print("[Gemini Direct] Cleaned up uploaded file from Files API")
-                except Exception as ex:
-                    print(f"[Gemini Direct] Cleanup failed: {ex}")
-    return []
+                txn["gst"] = ""
+    elif categorize and use_gemini_categorize and method == "native":
+        # Native parse doesn't include Gemini categories — enrich with Gemini
+        print("[Smart Parse] Enriching native results with Gemini categorization...")
+        transactions, g_calls = categorize_and_tag_with_gemini(
+            transactions,
+            categorize=categorize,
+            gst=gst,
+        )
+        gemini_calls += g_calls
 
+    # ── Clean and format ──
+    transactions = clean_and_format_transactions(transactions)
+
+    # ── Deduplicate ──
+    transactions = _deduplicate_transactions(transactions)
+
+    elapsed = time.time() - overall_start
+    print(f"\n{'=' * 60}")
+    print(f"[Smart Parse] Done: {len(transactions)} txns via {method}")
+    print(f"[Smart Parse] Gemini API calls: {gemini_calls}")
+    print(f"[Smart Parse] Total time: {elapsed:.2f}s")
+    print(f"{'=' * 60}\n")
+
+    return {
+        "transactions": transactions,
+        "method": method,
+        "count": len(transactions),
+        "gemini_calls": gemini_calls,
+    }
