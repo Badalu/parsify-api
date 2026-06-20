@@ -43,7 +43,7 @@ else:
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Larger chunks = fewer API calls = lower cost
-GEMINI_CHUNK_SIZE = 200_000
+GEMINI_CHUNK_SIZE = 20_000
 
 # ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
