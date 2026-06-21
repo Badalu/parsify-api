@@ -42,6 +42,14 @@ else:
 # ── Configuration ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
+if GEMINI_API_KEY:
+    if GEMINI_API_KEY.startswith("AIza"):
+        print(f"[Config] Gemini API Key loaded (valid format, ends with ...{GEMINI_API_KEY[-4:]})")
+    else:
+        print(f"[Config] WARNING: Gemini API Key may be INVALID — expected to start with 'AIza', got '{GEMINI_API_KEY[:4]}...'")
+else:
+    print("[Config] WARNING: GEMINI_API_KEY not set — AI parsing will be unavailable")
+
 # Larger chunks = fewer API calls = lower cost
 GEMINI_CHUNK_SIZE = 20_000
 

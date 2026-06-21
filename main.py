@@ -264,20 +264,20 @@ def evaluate_native_confidence(txns: List[dict], page_count: int) -> bool:
         
     total_txns = len(txns)
     
-    # 1. Check average txns per page (very loose check)
-    if total_txns < max(1, page_count) * 2 and page_count > 1:
+    # 1. Check average txns per page (relaxed: at least 1 txn per page, skip for single page)
+    if page_count > 2 and total_txns < max(1, page_count - 1):
         print(f"[Native Confidence] Low txn count: {total_txns} for {page_count} pages.")
         return False
         
-    # 2. Check completeness (missing amounts)
+    # 2. Check completeness (missing amounts) — allow up to 50% missing
     incomplete_count = sum(1 for t in txns if not str(t.get("debit", "")).strip() and not str(t.get("credit", "")).strip())
-    if incomplete_count > total_txns * 0.3:
+    if incomplete_count > total_txns * 0.5:
         print(f"[Native Confidence] Low completeness: {incomplete_count}/{total_txns} lack amounts.")
         return False
         
-    # 3. Check for valid dates
+    # 3. Check for valid dates — allow up to 40% invalid
     invalid_dates = sum(1 for t in txns if not is_valid_date(t.get("date", "")))
-    if invalid_dates > total_txns * 0.3:
+    if invalid_dates > total_txns * 0.4:
         print(f"[Native Confidence] Invalid dates: {invalid_dates}/{total_txns} have bad dates.")
         return False
         
@@ -455,27 +455,47 @@ async def convert_statement(
                 except Exception as e:
                     print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
 
-            # ── Gemini Fallback ──
+            # ── Gemini Text Fallback ──
             if not raw_txns:
-                print(f"[Gemini] Fallback parsing starting: {file.filename}")
+                print(f"[Gemini] Fallback text parsing starting: {file.filename}")
                 try:
                     text = await asyncio.to_thread(extract_full_text, temp_path, password)
                     raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
                     if raw_txns:
                         gemini_used_for_extraction = True
-                        print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via fallback")
+                        print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via text fallback")
                 except Exception as e:
-                    print(f"[Gemini] [ERROR] Fallback parsing failed: {e}")
-                    if low_confidence_txns:
-                        print(f"[Gemini] Rescuing low confidence native txns due to API failure.")
-                        raw_txns = low_confidence_txns
-                    else:
-                        err_msg = str(e).lower()
-                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                    print(f"[Gemini] [ERROR] Text fallback failed: {e}")
+                    err_msg = str(e).lower()
+                    if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                        if not low_confidence_txns:
                             raise HTTPException(
                                 status_code=402,
-                                detail="Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."
+                                detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
                             )
+
+            # ── Gemini File API Fallback (last resort for text-based PDFs) ──
+            if not raw_txns:
+                print(f"[Gemini File] Final fallback — uploading full PDF: {file.filename}")
+                try:
+                    raw_txns, _g_calls = await asyncio.to_thread(
+                        parse_file_directly_with_gemini,
+                        temp_path,
+                        mime_type,
+                        categorize=categorize,
+                        gst=gst
+                    )
+                    if raw_txns:
+                        gemini_used_for_extraction = True
+                        print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API fallback")
+                except Exception as e:
+                    print(f"[Gemini File] [ERROR] File API fallback also failed: {e}")
+
+            # ── Rescue low confidence native txns if all Gemini paths failed ──
+            if not raw_txns and low_confidence_txns:
+                print(f"[Rescue] Using {len(low_confidence_txns)} low-confidence native txns (all Gemini paths failed)")
+                raw_txns = low_confidence_txns
+
         else:
             # Scanned PDF or Image screenshot: parse directly via Files API multimodal
             print(f"[Gemini Direct] Parsing scanned PDF or Image directly: {file.filename}")
@@ -496,7 +516,7 @@ async def convert_statement(
                 if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
                     raise HTTPException(
                         status_code=402,
-                        detail="Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."
+                        detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
                     )
                 raise HTTPException(
                     status_code=500,
@@ -689,22 +709,36 @@ async def convert_batch(
                         pass
 
                 if not raw_txns:
-                    print(f"[Gemini] Fallback parsing starting for batch file: {f.filename}")
+                    print(f"[Gemini] Fallback text parsing for batch file: {f.filename}")
                     try:
                         text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
                         raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
                         if raw_txns:
                             gemini_used_for_extraction = True
                     except Exception as e:
-                        print(f"[Gemini] Batch fallback failed for {f.filename}: {e}")
-                        if low_confidence_txns:
-                            print(f"[Gemini] Rescuing low confidence native txns due to API failure.")
-                            raw_txns = low_confidence_txns
-                        else:
-                            err_msg = str(e).lower()
-                            if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
-                                return {"index": idx, "filename": f.filename, "success": False,
-                                        "error": "Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."}
+                        print(f"[Gemini] Batch text fallback failed for {f.filename}: {e}")
+
+                # Gemini File API fallback for batch
+                if not raw_txns:
+                    print(f"[Gemini File] Final fallback for batch file: {f.filename}")
+                    try:
+                        raw_txns, _g_calls = await asyncio.to_thread(
+                            parse_file_directly_with_gemini,
+                            temp_path,
+                            mime_type,
+                            categorize=categorize,
+                            gst=gst
+                        )
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                    except Exception as e:
+                        print(f"[Gemini File] Batch File API fallback failed for {f.filename}: {e}")
+
+                # Rescue low confidence native txns if all Gemini paths failed
+                if not raw_txns and low_confidence_txns:
+                    print(f"[Rescue] Using {len(low_confidence_txns)} low-confidence native txns for {f.filename}")
+                    raw_txns = low_confidence_txns
+
             else:
                 # Scanned PDF or Image screenshot
                 print(f"[Gemini Direct] Batch processing scanned PDF or Image directly: {f.filename}")
@@ -723,7 +757,7 @@ async def convert_batch(
                     err_msg = str(e).lower()
                     if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
                         return {"index": idx, "filename": f.filename, "success": False,
-                                "error": "Gemini AI API Key has a billing issue (Lightning dunning decision is deny). Please check your Google Cloud Billing status or update your API key."}
+                                "error": "Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status."}
                     return {"index": idx, "filename": f.filename, "success": False, "error": f"AI parsing failed: {str(e)}"}
 
             if not raw_txns:

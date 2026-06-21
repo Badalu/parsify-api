@@ -5,6 +5,7 @@ pdfplumber
 pypdf
 pandas
 openpyxl
+google-genai
 google-generativeai
 supabase
 python-dotenv
