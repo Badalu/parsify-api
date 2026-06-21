@@ -474,11 +474,17 @@ async def convert_statement(
                     except Exception as e:
                         print(f"[Gemini File] [ERROR] File API failed: {e}")
                         err_msg = str(e).lower()
-                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                        if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
                             if not low_confidence_txns:
                                 raise HTTPException(
                                     status_code=402,
                                     detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                )
+                        if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=429,
+                                    detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
                                 )
                 else:
                     # Small PDFs: try text chunks first (cheaper)
@@ -492,11 +498,17 @@ async def convert_statement(
                     except Exception as e:
                         print(f"[Gemini] [ERROR] Text fallback failed: {e}")
                         err_msg = str(e).lower()
-                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                        if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
                             if not low_confidence_txns:
                                 raise HTTPException(
                                     status_code=402,
                                     detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                )
+                        if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=429,
+                                    detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
                                 )
 
                     # Small PDF File API fallback if text chunks also failed
@@ -515,6 +527,19 @@ async def convert_statement(
                                 print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API fallback")
                         except Exception as e:
                             print(f"[Gemini File] [ERROR] File API fallback also failed: {e}")
+                            err_msg = str(e).lower()
+                            if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                                if not low_confidence_txns:
+                                    raise HTTPException(
+                                        status_code=402,
+                                        detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                    )
+                            if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                                if not low_confidence_txns:
+                                    raise HTTPException(
+                                        status_code=429,
+                                        detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
+                                    )
 
             # ── Rescue low confidence native txns if all Gemini paths failed ──
             if not raw_txns and low_confidence_txns:
@@ -538,10 +563,15 @@ async def convert_statement(
             except Exception as e:
                 print(f"[Gemini Direct] [ERROR] Direct parsing failed: {e}")
                 err_msg = str(e).lower()
-                if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
                     raise HTTPException(
                         status_code=402,
                         detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                    )
+                if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
                     )
                 raise HTTPException(
                     status_code=500,
