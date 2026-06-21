@@ -339,9 +339,11 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
 
     date_kws = ["date", "dt", "txn d", "trans d"]
     desc_kws = ["particulars", "description", "narration", "remarks", "transaction details", "details", "narrative"]
-    debit_kws = ["debit", "withdrawal", "payment", "dr", "withdraw"]
-    credit_kws = ["credit", "deposit", "receipt", "cr"]
+    debit_kws = ["debit", "withdrawal", "payment", "withdraw"]
+    credit_kws = ["credit", "deposit", "receipt"]
     balance_kws = ["balance", "bal", "running"]
+    amount_kws = ["amount", "amt", "transaction value", "txn amt", "txn amount"]
+    dr_cr_kws = ["dr/cr", "dr / cr", "d/c", "type", "dr_cr", "cr/dr", "cr / dr"]
 
     for idx, cell in enumerate(row_lower):
         if not cell:
@@ -357,10 +359,19 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
             mapping["description"] = idx
 
         if any(kw in cell for kw in debit_kws):
-            mapping["debit"] = idx
+            if cell != "dr" and cell != "cr":
+                mapping["debit"] = idx
 
         if any(kw in cell for kw in credit_kws):
-            mapping["credit"] = idx
+            if cell != "dr" and cell != "cr":
+                mapping["credit"] = idx
+
+        if any(kw in cell for kw in amount_kws):
+            if "debit" not in cell and "credit" not in cell and "payment" not in cell and "deposit" not in cell and "withdraw" not in cell:
+                mapping["amount"] = idx
+
+        if any(kw in cell for kw in dr_cr_kws) or cell in ["dr", "cr", "d/c"]:
+            mapping["dr_cr"] = idx
 
         if any(kw in cell for kw in balance_kws):
             mapping["balance"] = idx
@@ -675,6 +686,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                         desc_idx = header_mapping.get("description")
                         debit_idx = header_mapping.get("debit")
                         credit_idx = header_mapping.get("credit")
+                        amount_idx = header_mapping.get("amount")
+                        dr_cr_idx = header_mapping.get("dr_cr")
                         balance_idx = header_mapping.get("balance")
                         val_date_idx = header_mapping.get("value_date")
 
@@ -687,26 +700,49 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                         if is_valid_date(date_val):
                             debit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
                             credit_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
+                            
+                            # Handle single amount column + dr/cr column
+                            if not debit_val and not credit_val and amount_idx is not None and amount_idx < len(clean_row):
+                                amt_val = clean_row[amount_idx]
+                                type_val = clean_row[dr_cr_idx].lower().strip() if (dr_cr_idx is not None and dr_cr_idx < len(clean_row)) else ""
+                                
+                                if "dr" in type_val or type_val == "d":
+                                    debit_val = amt_val
+                                elif "cr" in type_val or type_val == "c":
+                                    credit_val = amt_val
+                                else:
+                                    # Fallback: check amount sign or inline dr/cr
+                                    amt_lower = amt_val.lower()
+                                    if amt_val.startswith("-"):
+                                        debit_val = amt_val.lstrip("-")
+                                    elif "dr" in amt_lower:
+                                        debit_val = re.sub(r'(?i)\s*dr\s*$', '', amt_val)
+                                    elif "cr" in amt_lower:
+                                        credit_val = re.sub(r'(?i)\s*cr\s*$', '', amt_val)
+                                    else:
+                                        credit_val = amt_val
+
                             balance_val = clean_row[balance_idx] if balance_idx is not None and balance_idx < len(clean_row) else ""
                             val_date_val = clean_row[val_date_idx] if val_date_idx is not None and val_date_idx < len(clean_row) else ""
 
                             # Repair column shift: when value_date col has text instead of date (borderless tables)
-                            if (val_date_idx is not None and val_date_val
-                                    and len(val_date_val) > 11
-                                    and not is_valid_date(val_date_val)
-                                    and re.search(r'[A-Za-z]{2,}', val_date_val)):
-                                balance_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
-                                credit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
-                                debit_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
-                                desc_val = val_date_val
-                                val_date_val = date_val
+                            if amount_idx is None:
+                                if (val_date_idx is not None and val_date_val
+                                        and len(val_date_val) > 11
+                                        and not is_valid_date(val_date_val)
+                                        and re.search(r'[A-Za-z]{2,}', val_date_val)):
+                                    balance_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
+                                    credit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
+                                    debit_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
+                                    desc_val = val_date_val
+                                    val_date_val = date_val
 
-                            # If debit is still alphabetic (not an amount), description spilled over
-                            if debit_val and re.search(r'[A-Za-z]{3,}', debit_val) and "dr" not in debit_val.lower():
-                                desc_val += " " + debit_val
-                                debit_val = credit_val
-                                credit_val = balance_val
-                                balance_val = clean_row[balance_idx + 1] if balance_idx is not None and balance_idx + 1 < len(clean_row) else ""
+                                # If debit is still alphabetic (not an amount), description spilled over
+                                if debit_val and re.search(r'[A-Za-z]{3,}', debit_val) and "dr" not in debit_val.lower():
+                                    desc_val += " " + debit_val
+                                    debit_val = credit_val
+                                    credit_val = balance_val
+                                    balance_val = clean_row[balance_idx + 1] if balance_idx is not None and balance_idx + 1 < len(clean_row) else ""
 
                             txn = {
                                 "date": date_val,
