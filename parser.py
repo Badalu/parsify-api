@@ -51,7 +51,7 @@ else:
     print("[Config] WARNING: GEMINI_API_KEY not set — AI parsing will be unavailable")
 
 # Larger chunks = fewer API calls = lower cost
-GEMINI_CHUNK_SIZE = 20_000
+GEMINI_CHUNK_SIZE = 40_000
 
 # ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
@@ -961,21 +961,25 @@ def parse_with_gemini(
             chunks.append((chunk_num, current_chunk))
 
         total_chunks = len(chunks)
-        print(f"  Processing {total_chunks} chunks sequentially...")
+        print(f"  Processing {total_chunks} chunks in parallel...")
 
-        for c_num, chunk_text in chunks:
-            if c_num > 1:
-                # 1s delay between chunks for rate-limit safety
-                time.sleep(1.0)
+        from concurrent.futures import ThreadPoolExecutor
 
+        def process_chunk(item):
+            c_num, chunk_text = item
             print(f"  Processing chunk {c_num} of {total_chunks}...")
-            txns = _call_gemini_chunk(
+            return _call_gemini_chunk(
                 model_or_client,
                 system_prompt,
                 chunk_text,
                 c_num,
                 f"(Chunk {c_num} of {total_chunks} — process only transactions in this section)",
             )
+
+        with ThreadPoolExecutor(max_workers=min(total_chunks, 10)) as executor:
+            chunk_results = list(executor.map(process_chunk, chunks))
+
+        for txns in chunk_results:
             all_transactions.extend(txns)
             gemini_calls += 1
 
