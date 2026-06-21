@@ -455,41 +455,66 @@ async def convert_statement(
                 except Exception as e:
                     print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
 
-            # ── Gemini Text Fallback ──
+            # ── Gemini Fallback — choose strategy based on page count ──
             if not raw_txns:
-                print(f"[Gemini] Fallback text parsing starting: {file.filename}")
-                try:
-                    text = await asyncio.to_thread(extract_full_text, temp_path, password)
-                    raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
-                    if raw_txns:
-                        gemini_used_for_extraction = True
-                        print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via text fallback")
-                except Exception as e:
-                    print(f"[Gemini] [ERROR] Text fallback failed: {e}")
-                    err_msg = str(e).lower()
-                    if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
-                        if not low_confidence_txns:
-                            raise HTTPException(
-                                status_code=402,
-                                detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
-                            )
+                if page_count >= 10:
+                    # Large PDFs: skip text chunking, go directly to File API (faster, single call)
+                    print(f"[Gemini File] Large PDF ({page_count} pages) — using File API directly: {file.filename}")
+                    try:
+                        raw_txns, _g_calls = await asyncio.to_thread(
+                            parse_file_directly_with_gemini,
+                            temp_path,
+                            mime_type,
+                            categorize=categorize,
+                            gst=gst
+                        )
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                            print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API")
+                    except Exception as e:
+                        print(f"[Gemini File] [ERROR] File API failed: {e}")
+                        err_msg = str(e).lower()
+                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=402,
+                                    detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                )
+                else:
+                    # Small PDFs: try text chunks first (cheaper)
+                    print(f"[Gemini] Fallback text parsing starting: {file.filename}")
+                    try:
+                        text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                        raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, text, categorize=categorize, gst=gst)
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                            print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via text fallback")
+                    except Exception as e:
+                        print(f"[Gemini] [ERROR] Text fallback failed: {e}")
+                        err_msg = str(e).lower()
+                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=402,
+                                    detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                )
 
-            # ── Gemini File API Fallback (last resort for text-based PDFs) ──
-            if not raw_txns:
-                print(f"[Gemini File] Final fallback — uploading full PDF: {file.filename}")
-                try:
-                    raw_txns, _g_calls = await asyncio.to_thread(
-                        parse_file_directly_with_gemini,
-                        temp_path,
-                        mime_type,
-                        categorize=categorize,
-                        gst=gst
-                    )
-                    if raw_txns:
-                        gemini_used_for_extraction = True
-                        print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API fallback")
-                except Exception as e:
-                    print(f"[Gemini File] [ERROR] File API fallback also failed: {e}")
+                    # Small PDF File API fallback if text chunks also failed
+                    if not raw_txns:
+                        print(f"[Gemini File] Final fallback — uploading full PDF: {file.filename}")
+                        try:
+                            raw_txns, _g_calls = await asyncio.to_thread(
+                                parse_file_directly_with_gemini,
+                                temp_path,
+                                mime_type,
+                                categorize=categorize,
+                                gst=gst
+                            )
+                            if raw_txns:
+                                gemini_used_for_extraction = True
+                                print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API fallback")
+                        except Exception as e:
+                            print(f"[Gemini File] [ERROR] File API fallback also failed: {e}")
 
             # ── Rescue low confidence native txns if all Gemini paths failed ──
             if not raw_txns and low_confidence_txns:

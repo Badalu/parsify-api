@@ -798,7 +798,7 @@ def _call_gemini_chunk(
         f"BANK STATEMENT TEXT:\n{'=' * 60}\n{text_chunk}\n{'=' * 60}"
     )
 
-    max_retries = 5
+    max_retries = 3
     for attempt in range(max_retries):
         try:
             if GENAI_NEW_SDK:
@@ -840,11 +840,11 @@ def _call_gemini_chunk(
             print(f"  Chunk {chunk_num} attempt {attempt + 1} failed: {e}")
 
             if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg or "limit" in err_msg:
-                print(f"Rate limit hit on chunk {chunk_num}. Sleeping 10s before retry...")
-                time.sleep(10)
+                print(f"Rate limit hit on chunk {chunk_num}. Sleeping 5s before retry...")
+                time.sleep(5)
 
             if attempt < max_retries - 1:
-                backoff = min(2 ** attempt, 8)  # 1s, 2s, 4s, 8s
+                backoff = min(2 ** attempt, 4)  # 1s, 2s, 4s
                 time.sleep(backoff)
             else:
                 raise
@@ -929,8 +929,8 @@ def parse_with_gemini(
 
         for c_num, chunk_text in chunks:
             if c_num > 1:
-                # 2s delay between chunks for rate-limit safety
-                time.sleep(2.0)
+                # 1s delay between chunks for rate-limit safety
+                time.sleep(1.0)
 
             print(f"  Processing chunk {c_num} of {total_chunks}...")
             txns = _call_gemini_chunk(
@@ -980,7 +980,7 @@ def parse_file_directly_with_gemini(
         "Return every transaction row, do not skip any."
     )
 
-    max_retries = 3
+    max_retries = 2
     for attempt in range(max_retries):
         uploaded_file = None
         try:
@@ -993,7 +993,7 @@ def parse_file_directly_with_gemini(
                 if mime_type == "application/pdf":
                     state_str = str(uploaded_file.state).upper()
                     wait_time = 0
-                    while "PROCESSING" in state_str and wait_time < 30:
+                    while "PROCESSING" in state_str and wait_time < 20:
                         print("Waiting for PDF processing in Files API...")
                         time.sleep(2)
                         wait_time += 2
@@ -1026,7 +1026,7 @@ def parse_file_directly_with_gemini(
                 if mime_type == "application/pdf":
                     state_str = str(uploaded_file.state).upper()
                     wait_time = 0
-                    while "PROCESSING" in state_str and wait_time < 30:
+                    while "PROCESSING" in state_str and wait_time < 20:
                         print("Waiting for PDF processing in legacy Files API...")
                         time.sleep(2)
                         wait_time += 2
@@ -1069,9 +1069,9 @@ def parse_file_directly_with_gemini(
 
             print(f"[Gemini File API] Attempt {attempt + 1} failed: {e}")
             if "429" in err_msg or "quota" in err_msg or "resource_exhausted" in err_msg:
-                time.sleep(10)
+                time.sleep(5)
             if attempt < max_retries - 1:
-                backoff = min(2 ** attempt, 8)
+                backoff = min(2 ** attempt, 4)
                 time.sleep(backoff)
             else:
                 raise
