@@ -252,11 +252,19 @@ def extract_full_text(pdf_path: str, password: str = None) -> str:
 
 DATE_PATTERNS = [
     re.compile(r'^\s*\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\s*$'),          # 12/05/2023, 12-05-23
-    re.compile(r'^\s*\d{1,2}[-/\.][A-Za-z]{3,4}[-/\.]\d{2,4}\s*$'),    # 12-May-2023, 12-May-23
-    re.compile(r'^\s*\d{1,2}\s+[A-Za-z]{3,4}\s+\d{2,4}\s*$'),           # 12 May 2023, 12 May 23
-    re.compile(r'^\s*[A-Za-z]{3,4}\s+\d{1,2},?\s+\d{2,4}\s*$'),        # May 12, 2023, May 12 23
+    re.compile(r'^\s*\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4}\s*$'),   # 12-May-2023, 12-September-23
+    re.compile(r'^\s*\d{1,2}\s*[A-Za-z]{3,9}\s*\d{2,4}\s*$'),          # 12May2023, 12 May 23, 12May23
+    re.compile(r'^\s*\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\s*$'),          # 12 May 2023, 12 May 23
+    re.compile(r'^\s*[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}\s*$'),       # May 12, 2023, May 12 23
     re.compile(r'^\s*\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}\s*$'),            # 2023-05-12
+    re.compile(r'^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}\s*$'),              # 12/05/23 (no dot)
+    re.compile(r'^\s*\d{1,2}\s*[-/\.]\s*\d{1,2}\s*[-/\.]\s*\d{2,4}\s*$'),  # 12 / 05 / 2023 (spaced)
+    re.compile(r'^\s*\d{2}\d{2}\d{4}\s*$'),                             # 12052023 (compact, 8 digits)
+    re.compile(r'^\s*\d{1,2}[-/\.\s][A-Za-z]{3,9}[-/\.\s]?\d{0,4}\s*$'),  # 12-May or 12 May (no year)
 ]
+
+# Pre-compiled cleanup for date values
+_DATE_CLEANUP_RE = re.compile(r'[\n\r\t]+')
 
 
 def is_valid_date(val: str) -> bool:
@@ -264,6 +272,10 @@ def is_valid_date(val: str) -> bool:
     if not val:
         return False
     val_str = str(val).strip()
+    # Clean up newlines/tabs that pdfplumber sometimes leaves in cell values
+    val_str = _DATE_CLEANUP_RE.sub(' ', val_str).strip()
+    if not val_str or len(val_str) < 4 or len(val_str) > 25:
+        return False
     for pattern in DATE_PATTERNS:
         if pattern.match(val_str):
             return True
@@ -336,52 +348,108 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
     """
     mapping = {}
     row_lower = [str(cell).lower().strip() if cell is not None else "" for cell in row]
+    # Also clean newlines within cell text (pdfplumber sometimes has these)
+    row_lower = [re.sub(r'[\n\r\t]+', ' ', c).strip() for c in row_lower]
 
-    date_kws = ["date", "dt", "txn d", "trans d"]
-    desc_kws = ["particulars", "description", "narration", "remarks", "transaction details", "details", "narrative"]
-    debit_kws = ["debit", "withdrawal", "payment", "withdraw"]
-    credit_kws = ["credit", "deposit", "receipt"]
-    balance_kws = ["balance", "bal", "running"]
-    amount_kws = ["amount", "amt", "transaction value", "txn amt", "txn amount"]
-    dr_cr_kws = ["dr/cr", "dr / cr", "d/c", "type", "dr_cr", "cr/dr", "cr / dr"]
+    date_kws = ["date", "dt", "txn d", "trans d", "posting d", "post d", "trn d"]
+    desc_kws = [
+        "particulars", "description", "narration", "remarks",
+        "transaction details", "details", "narrative", "desc",
+        "party name", "beneficiary", "payee"
+    ]
+    debit_kws = ["debit", "withdrawal", "payment", "withdraw", "withdrawal(dr)", "withdrawal amt", "dr amount"]
+    credit_kws = ["credit", "deposit", "receipt", "deposit(cr)", "deposit amt", "cr amount"]
+    balance_kws = ["balance", "bal", "running", "closing bal", "available"]
+    amount_kws = ["amount", "amt", "transaction value", "txn amt", "txn amount", "transaction amt"]
+    dr_cr_kws = ["dr/cr", "dr / cr", "d/c", "dr_cr", "cr/dr", "cr / dr", "dr./cr."]
 
     for idx, cell in enumerate(row_lower):
         if not cell:
             continue
 
+        # Date columns
         if any(kw in cell for kw in date_kws):
-            if "value" not in cell and "post" not in cell and "val" not in cell:
-                mapping["date"] = idx
-            elif "value" in cell or "val" in cell:
+            if "value" in cell or "val" in cell or "clearing" in cell:
                 mapping["value_date"] = idx
+            else:
+                if "date" not in mapping:  # take the first date column found
+                    mapping["date"] = idx
 
+        # Description columns
         if any(kw in cell for kw in desc_kws):
-            mapping["description"] = idx
+            if "description" not in mapping:  # take the first description column
+                mapping["description"] = idx
 
+        # Debit columns — but NOT if the cell is just "dr" or "cr" alone (that's dr_cr column)
         if any(kw in cell for kw in debit_kws):
-            if cell != "dr" and cell != "cr":
+            if cell not in ("dr", "cr", "d", "c", "dr/cr", "cr/dr", "type", "d/c"):
                 mapping["debit"] = idx
 
+        # Credit columns
         if any(kw in cell for kw in credit_kws):
-            if cell != "dr" and cell != "cr":
+            if cell not in ("dr", "cr", "d", "c", "dr/cr", "cr/dr", "type", "d/c"):
                 mapping["credit"] = idx
 
+        # Single Amount column
         if any(kw in cell for kw in amount_kws):
-            if "debit" not in cell and "credit" not in cell and "payment" not in cell and "deposit" not in cell and "withdraw" not in cell:
+            if not any(skip in cell for skip in ["debit", "credit", "payment", "deposit", "withdraw", "dr", "cr"]):
                 mapping["amount"] = idx
 
-        if any(kw in cell for kw in dr_cr_kws) or cell in ["dr", "cr", "d/c"]:
+        # Dr/Cr type column
+        if any(kw in cell for kw in dr_cr_kws) or cell in ["dr", "cr", "d/c", "type"]:
             mapping["dr_cr"] = idx
 
+        # Balance columns
         if any(kw in cell for kw in balance_kws):
             mapping["balance"] = idx
 
-    if "date" in mapping and "description" in mapping:
+    # Fallback if date is not found but value_date is
+    if "date" not in mapping and "value_date" in mapping:
+        mapping["date"] = mapping["value_date"]
+
+    # Accept if we have at least date + description OR date + amount
+    if "date" in mapping and ("description" in mapping or "amount" in mapping):
         return mapping
     return {}
 
 
 # ── Line-by-Line Regex Parser ────────────────────────────────────────────────
+
+def _is_amount_str(s: str) -> bool:
+    """Check if a string looks like a monetary amount (handles Indian format)."""
+    if not s:
+        return False
+    s_clean = s.strip()
+    # Remove currency symbols
+    s_clean = re.sub(r'(?i)(rs\.?|inr|usd|₹|\$|£|€)', '', s_clean).strip()
+    # Handle parenthetical negatives: (500.00) → 500.00
+    if s_clean.startswith('(') and s_clean.endswith(')'):
+        s_clean = s_clean[1:-1].strip()
+    # Remove Dr/Cr suffixes
+    s_clean = re.sub(r'(?i)\s*(dr|cr)\s*$', '', s_clean).strip()
+    # Remove commas, plus, minus, spaces
+    s_clean = s_clean.replace(",", "").replace("+", "").replace(" ", "").strip()
+    # Remove leading minus
+    if s_clean.startswith("-"):
+        s_clean = s_clean[1:]
+    if not s_clean:
+        return False
+    try:
+        float(s_clean)
+        return True
+    except ValueError:
+        return False
+
+
+def _has_dr_suffix(s: str) -> bool:
+    """Check if amount has Dr suffix (debit indicator)."""
+    return bool(re.search(r'(?i)\s*dr\s*$', s.strip()))
+
+
+def _has_cr_suffix(s: str) -> bool:
+    """Check if amount has Cr suffix (credit indicator)."""
+    return bool(re.search(r'(?i)\s*cr\s*$', s.strip()))
+
 
 def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
     """
@@ -393,11 +461,22 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
 
     header_bounds = {}
 
-    date_kws = ["date", "dt", "txn d", "trans d"]
-    desc_kws = ["particulars", "description", "narration", "remarks", "transaction details", "details", "narrative"]
-    debit_kws = ["debit", "withdrawal", "payment", "dr", "withdraw", "withdrawal(dr)"]
-    credit_kws = ["credit", "deposit", "receipt", "cr", "deposit(cr)"]
-    balance_kws = ["balance", "bal", "running"]
+    date_kws = ["date", "dt", "txn d", "trans d", "posting d", "trn d"]
+    desc_kws = [
+        "particulars", "description", "narration", "remarks",
+        "transaction details", "details", "narrative", "desc"
+    ]
+    debit_kws = ["debit", "withdrawal", "payment", "dr", "withdraw", "withdrawal(dr)", "withdrawal amt"]
+    credit_kws = ["credit", "deposit", "receipt", "cr", "deposit(cr)", "deposit amt"]
+    balance_kws = ["balance", "bal", "running", "closing"]
+
+    # Skip words for non-transaction lines
+    skip_words = [
+        "balance brought", "carried forward", "balance carried", "brought forward",
+        "total", "page ", "statement", "generated on", "opening balance",
+        "closing balance", "printed on", "branch", "customer", "account no",
+        "ifsc", "micr", "address", "email", "mobile", "phone"
+    ]
 
     # First pass: find the header line and compute column boundaries
     for line in lines:
@@ -405,12 +484,14 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
         if any(kw in line_lower for kw in date_kws) and any(kw in line_lower for kw in desc_kws):
             bounds = {}
 
+            # Find date columns — be careful about value_date vs date
             for kw in date_kws:
                 idx = line_lower.find(kw)
                 if idx != -1:
-                    if "value" in line_lower[max(0, idx - 10):idx + 20] or "val" in line_lower[max(0, idx - 10):idx + 20]:
+                    surrounding = line_lower[max(0, idx - 12):idx + 25]
+                    if any(v in surrounding for v in ["value", "val ", "clearing", "post"]):
                         bounds["value_date"] = idx
-                    else:
+                    elif "date" not in bounds:
                         bounds["date"] = idx
 
             if "date" not in bounds:
@@ -441,7 +522,13 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
             for kw in balance_kws:
                 idx = line_lower.find(kw)
                 if idx != -1:
-                    bounds["balance"] = idx
+                    # Make sure it's not "closing balance" used as a summary
+                    if "closing" in line_lower[max(0, idx - 10):idx + 2]:
+                        # Only use if there are other column headers too
+                        if len(bounds) >= 2:
+                            bounds["balance"] = idx
+                    else:
+                        bounds["balance"] = idx
                     break
 
             if "date" in bounds and "description" in bounds:
@@ -449,15 +536,20 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 header_bounds = {}
                 for i in range(len(sorted_cols)):
                     col_name, start = sorted_cols[i]
-                    col_start = start
+                    # Use the midpoint between this column's start and the previous column's start
                     if i > 0:
                         prev_name, prev_start = sorted_cols[i - 1]
-                        col_start = (prev_start + col_start) // 2 + 2
+                        col_start = start - 2  # start 2 chars before the keyword
                     else:
                         col_start = 0
 
-                    col_end = sorted_cols[i + 1][1] if i < len(sorted_cols) - 1 else 300
-                    header_bounds[col_name] = (col_start, col_end)
+                    if i < len(sorted_cols) - 1:
+                        next_start = sorted_cols[i + 1][1]
+                        col_end = next_start - 1
+                    else:
+                        col_end = max(500, len(line) + 50)  # extend for last column
+
+                    header_bounds[col_name] = (max(0, col_start), col_end)
                 break
 
     # Second pass: extract transactions using column boundaries
@@ -465,17 +557,23 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
         if not line.strip():
             continue
 
-        line_lower = line.lower()
+        line_lower = line.lower().strip()
+
+        # Skip header lines
         if any(kw in line_lower for kw in date_kws) and any(kw in line_lower for kw in desc_kws):
             continue
 
+        # Skip non-transaction footer/summary lines
+        if any(sw in line_lower for sw in skip_words):
+            continue
+
         if header_bounds:
-            date_idx = header_bounds.get("date")
-            desc_idx = header_bounds.get("description")
-            debit_idx = header_bounds.get("debit")
-            credit_idx = header_bounds.get("credit")
-            balance_idx = header_bounds.get("balance")
-            val_date_idx = header_bounds.get("value_date")
+            date_b = header_bounds.get("date")
+            desc_b = header_bounds.get("description")
+            debit_b = header_bounds.get("debit")
+            credit_b = header_bounds.get("credit")
+            balance_b = header_bounds.get("balance")
+            val_date_b = header_bounds.get("value_date")
 
             def get_slice(b):
                 if not b:
@@ -483,14 +581,14 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 s, e = b
                 return line[s:min(e, len(line))].strip() if s < len(line) else ""
 
-            date_val = get_slice(date_idx)
-            desc_val = get_slice(desc_idx)
+            date_val = get_slice(date_b)
+            desc_val = get_slice(desc_b)
 
             if is_valid_date(date_val):
-                debit_val = get_slice(debit_idx)
-                credit_val = get_slice(credit_idx)
-                balance_val = get_slice(balance_idx)
-                val_date_val = get_slice(val_date_idx)
+                debit_val = get_slice(debit_b)
+                credit_val = get_slice(credit_b)
+                balance_val = get_slice(balance_b)
+                val_date_val = get_slice(val_date_b)
 
                 if not desc_val:
                     continue
@@ -508,13 +606,12 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 continue
 
             elif desc_val and transactions:
-                skip_words = ["balance", "carried", "brought", "total", "page", "statement", "generated on", "opening", "closing"]
                 if not any(sw in desc_val.lower() for sw in skip_words):
                     transactions[-1]["description"] += " " + desc_val
 
-                    debit_val = get_slice(debit_idx)
-                    credit_val = get_slice(credit_idx)
-                    balance_val = get_slice(balance_idx)
+                    debit_val = get_slice(debit_b)
+                    credit_val = get_slice(credit_b)
+                    balance_val = get_slice(balance_b)
 
                     if debit_val and not transactions[-1]["debit"]:
                         transactions[-1]["debit"] = debit_val
@@ -543,7 +640,7 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 continue
 
             value_date_val = date_val
-            if is_valid_date(remaining[0]):
+            if remaining and is_valid_date(remaining[0]):
                 value_date_val = remaining.pop(0)
 
             if not remaining:
@@ -552,26 +649,15 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
             amounts = []
             desc_parts = []
 
-            def is_amount(s):
-                s_clean = s.replace(",", "").replace("+", "").replace("-", "").strip()
-                # Remove Dr/Cr suffixes
-                s_clean = re.sub(r'(?i)(dr|cr)$', '', s_clean).strip()
-                if not s_clean:
-                    return False
-                try:
-                    float(s_clean)
-                    return True
-                except ValueError:
-                    return False
-
             for r in remaining:
-                if is_amount(r):
+                if _is_amount_str(r):
                     amounts.append(r)
                 else:
                     desc_parts.append(r)
 
             desc_val = " ".join(desc_parts).strip()
             if not desc_val:
+                # If no desc but amounts exist, skip (probably a summary line)
                 continue
 
             debit_val = ""
@@ -579,23 +665,43 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
             balance_val = ""
 
             if len(amounts) == 1:
-                desc_lower = desc_val.lower()
-                is_deb = any(kw in desc_lower for kw in ["payment", "upi to", "transfer to", "dr", "debit", "withdrawal"])
-                if is_deb:
-                    debit_val = amounts[0]
+                amt = amounts[0]
+                # Check for inline Dr/Cr suffix
+                if _has_dr_suffix(amt) or amt.startswith("-") or amt.startswith("("):
+                    debit_val = amt
+                elif _has_cr_suffix(amt):
+                    credit_val = amt
                 else:
-                    credit_val = amounts[0]
+                    # Guess from description
+                    desc_lower = desc_val.lower()
+                    is_deb = any(kw in desc_lower for kw in [
+                        "payment", "upi to", "transfer to", "debit", "withdrawal",
+                        "paid to", "neft to", "rtgs to", "imps to", "emi", "loan"
+                    ])
+                    if is_deb:
+                        debit_val = amt
+                    else:
+                        credit_val = amt
             elif len(amounts) == 2:
                 amt = amounts[0]
                 bal = amounts[1]
-                desc_lower = desc_val.lower()
-                is_deb = any(kw in desc_lower for kw in ["payment", "upi to", "transfer to", "dr", "debit", "withdrawal"]) or amt.startswith("-")
-                if is_deb:
+                # Check inline Dr/Cr
+                if _has_dr_suffix(amt) or amt.startswith("-") or amt.startswith("("):
                     debit_val = amt
-                else:
+                elif _has_cr_suffix(amt):
                     credit_val = amt
+                else:
+                    desc_lower = desc_val.lower()
+                    is_deb = any(kw in desc_lower for kw in [
+                        "payment", "upi to", "transfer to", "debit", "withdrawal",
+                        "paid to", "neft to", "rtgs to", "imps to", "emi", "loan"
+                    ]) or amt.startswith("-")
+                    if is_deb:
+                        debit_val = amt
+                    else:
+                        credit_val = amt
                 balance_val = bal
-            elif len(amounts) == 3:
+            elif len(amounts) >= 3:
                 debit_val = amounts[0]
                 credit_val = amounts[1]
                 balance_val = amounts[2]
@@ -611,11 +717,18 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
                 "gst": extract_gst_locally(desc_val),
             })
 
-        elif len(parts) == 1 and transactions:
-            val = parts[0]
-            skip_words = ["balance", "carried", "brought", "total", "page", "statement", "generated on", "opening", "closing"]
+        elif transactions and len(parts) <= 2:
+            # Continuation line (multi-line description or trailing amounts)
+            val = " ".join(parts).strip()
             if not any(sw in val.lower() for sw in skip_words) and len(val) > 3:
-                transactions[-1]["description"] += " " + val
+                # Check if this is a trailing amount for the last txn
+                if len(parts) == 1 and _is_amount_str(val):
+                    if not transactions[-1]["balance"]:
+                        transactions[-1]["balance"] = val
+                    elif not transactions[-1]["debit"] and not transactions[-1]["credit"]:
+                        transactions[-1]["credit"] = val  # default to credit
+                else:
+                    transactions[-1]["description"] += " " + val
 
     return transactions
 
@@ -625,10 +738,14 @@ def parse_line_by_line(text: str) -> List[Dict[str, Any]]:
 def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, Any]]:
     """
     Extract transactions from structured PDF statements natively using pdfplumber.
-    25s timeout, 100 page limit. Includes column-shift repair for borderless tables.
+    30s timeout, 150 page limit. Includes:
+    - Standard table extraction + borderless text-strategy fallback
+    - Column-shift repair for borderless tables
+    - Repeated header detection (skip headers on every page)
+    - Cell value cleanup (newlines, whitespace)
     """
     start_time = time.time()
-    max_pages = 100
+    max_pages = 150
 
     try:
         reader = PdfReader(pdf_path, password=password)
@@ -642,25 +759,48 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     transactions: List[Dict[str, Any]] = []
     header_mapping: Dict[str, int] = {}
 
+    # Table settings to try: default first, then text-based for borderless tables
+    table_settings_list = [
+        {},  # default pdfplumber settings
+        {"vertical_strategy": "text", "horizontal_strategy": "text"},  # borderless
+    ]
+
     try:
         with pdfplumber.open(pdf_path, password=password) as pdf:
             table_found = False
             for idx, page in enumerate(pdf.pages):
-                # 25s timeout guard
-                if time.time() - start_time > 25.0:
-                    print(f"[Native] Timeout of 25s exceeded at page {idx + 1}/{len(pdf.pages)}. Aborting.")
-                    return []
-
-                if idx >= 2 and not table_found:
-                    print("[Native] No tables found in first 2 pages. Aborting table extraction.")
+                # 30s timeout guard
+                if time.time() - start_time > 30.0:
+                    print(f"[Native] Timeout of 30s exceeded at page {idx + 1}/{len(pdf.pages)}. Returning what we have.")
                     break
 
-                tables = page.extract_tables()
+                if idx >= 3 and not table_found:
+                    print("[Native] No tables found in first 3 pages. Aborting table extraction.")
+                    break
+
+                # Try multiple table extraction strategies
+                tables = []
+                for settings in table_settings_list:
+                    try:
+                        if settings:
+                            extracted = page.extract_tables(table_settings=settings)
+                        else:
+                            extracted = page.extract_tables()
+                        if extracted:
+                            tables = extracted
+                            break
+                    except Exception:
+                        continue
+
+                # Fallback to find_tables
                 if not tables:
                     try:
-                        tables = [t.extract() for t in page.find_tables()]
+                        found = page.find_tables()
+                        if found:
+                            tables = [t.extract() for t in found]
                     except Exception:
-                        tables = []
+                        pass
+
                 if tables:
                     table_found = True
 
@@ -669,11 +809,22 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                         continue
 
                     for row in table:
-                        clean_row = [str(cell).strip() if cell is not None else "" for cell in row]
+                        if row is None:
+                            continue
+                        # Clean cells: handle None, strip whitespace, clean newlines
+                        clean_row = []
+                        for cell in row:
+                            if cell is None:
+                                clean_row.append("")
+                            else:
+                                cleaned = str(cell).strip()
+                                cleaned = re.sub(r'[\n\r\t]+', ' ', cleaned).strip()
+                                clean_row.append(cleaned)
 
                         if not any(clean_row):
                             continue
 
+                        # Check if this row is a header (could be repeated on each page)
                         mapping = find_header_mapping(clean_row)
                         if mapping:
                             header_mapping = mapping
@@ -691,20 +842,33 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                         balance_idx = header_mapping.get("balance")
                         val_date_idx = header_mapping.get("value_date")
 
-                        date_val = clean_row[date_idx] if date_idx is not None and date_idx < len(clean_row) else ""
-                        desc_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
+                        def _safe_get(idx_val, row_data):
+                            if idx_val is not None and idx_val < len(row_data):
+                                return row_data[idx_val]
+                            return ""
+
+                        date_val = _safe_get(date_idx, clean_row)
+                        desc_val = _safe_get(desc_idx, clean_row)
 
                         if not desc_val and not date_val:
                             continue
 
+                        # Skip summary/footer rows
+                        combined_lower = (date_val + " " + desc_val).lower()
+                        if any(sw in combined_lower for sw in [
+                            "opening balance", "closing balance", "balance brought",
+                            "balance carried", "total", "grand total", "statement generated"
+                        ]):
+                            continue
+
                         if is_valid_date(date_val):
-                            debit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
-                            credit_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
+                            debit_val = _safe_get(debit_idx, clean_row)
+                            credit_val = _safe_get(credit_idx, clean_row)
                             
                             # Handle single amount column + dr/cr column
-                            if not debit_val and not credit_val and amount_idx is not None and amount_idx < len(clean_row):
-                                amt_val = clean_row[amount_idx]
-                                type_val = clean_row[dr_cr_idx].lower().strip() if (dr_cr_idx is not None and dr_cr_idx < len(clean_row)) else ""
+                            if not debit_val and not credit_val and amount_idx is not None:
+                                amt_val = _safe_get(amount_idx, clean_row)
+                                type_val = _safe_get(dr_cr_idx, clean_row).lower().strip()
                                 
                                 if "dr" in type_val or type_val == "d":
                                     debit_val = amt_val
@@ -712,18 +876,27 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                     credit_val = amt_val
                                 else:
                                     # Fallback: check amount sign or inline dr/cr
-                                    amt_lower = amt_val.lower()
-                                    if amt_val.startswith("-"):
+                                    amt_lower = amt_val.lower() if amt_val else ""
+                                    if amt_val and amt_val.startswith("-"):
                                         debit_val = amt_val.lstrip("-")
                                     elif "dr" in amt_lower:
                                         debit_val = re.sub(r'(?i)\s*dr\s*$', '', amt_val)
                                     elif "cr" in amt_lower:
                                         credit_val = re.sub(r'(?i)\s*cr\s*$', '', amt_val)
+                                    elif amt_val and amt_val.startswith("(") and amt_val.endswith(")"):
+                                        debit_val = amt_val[1:-1]
                                     else:
-                                        credit_val = amt_val
+                                        # Guess from description
+                                        if desc_val and any(kw in desc_val.lower() for kw in [
+                                            "payment", "withdrawal", "debit", "upi to", "neft to",
+                                            "paid", "emi", "loan"
+                                        ]):
+                                            debit_val = amt_val
+                                        else:
+                                            credit_val = amt_val
 
-                            balance_val = clean_row[balance_idx] if balance_idx is not None and balance_idx < len(clean_row) else ""
-                            val_date_val = clean_row[val_date_idx] if val_date_idx is not None and val_date_idx < len(clean_row) else ""
+                            balance_val = _safe_get(balance_idx, clean_row)
+                            val_date_val = _safe_get(val_date_idx, clean_row)
 
                             # Repair column shift: when value_date col has text instead of date (borderless tables)
                             if amount_idx is None:
@@ -731,9 +904,9 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                         and len(val_date_val) > 11
                                         and not is_valid_date(val_date_val)
                                         and re.search(r'[A-Za-z]{2,}', val_date_val)):
-                                    balance_val = clean_row[credit_idx] if credit_idx is not None and credit_idx < len(clean_row) else ""
-                                    credit_val = clean_row[debit_idx] if debit_idx is not None and debit_idx < len(clean_row) else ""
-                                    debit_val = clean_row[desc_idx] if desc_idx is not None and desc_idx < len(clean_row) else ""
+                                    balance_val = _safe_get(credit_idx, clean_row)
+                                    credit_val = _safe_get(debit_idx, clean_row)
+                                    debit_val = _safe_get(desc_idx, clean_row)
                                     desc_val = val_date_val
                                     val_date_val = date_val
 
@@ -777,10 +950,14 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
             full_text_list = []
             with pdfplumber.open(pdf_path, password=password) as pdf:
                 for page in pdf.pages:
-                    page_text = page.extract_text(layout=True)
-                    if page_text:
-                        full_text_list.append(page_text)
-                    page.flush_cache()
+                    try:
+                        page_text = page.extract_text(layout=True)
+                        if page_text:
+                            full_text_list.append(page_text)
+                    except Exception:
+                        pass
+                    finally:
+                        page.flush_cache()
             if full_text_list:
                 raw_text = "\n".join(full_text_list)
                 transactions = parse_line_by_line(raw_text)
@@ -1243,7 +1420,7 @@ def categorize_and_tag_with_gemini(
 def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str = "DD/MM/YYYY") -> List[Dict[str, Any]]:
     """
     pandas DataFrame cleanup: strip currency symbols, strip Dr/Cr suffixes,
-    fill NaN with empty string.
+    handle Indian lakh/crore format, fill NaN with empty string.
     """
     if not txns:
         return []
@@ -1257,26 +1434,54 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
             df[col] = df[col].astype(str).str.strip()
 
     def clean_amount(val):
-        if not val or val in ("—", "None", "null", "nil", "N/A", "n/a"):
+        if not val or val in ("—", "None", "null", "nil", "N/A", "n/a", "nan"):
             return ""
+        cleaned = str(val).strip()
+        # Handle parenthetical negatives: (500.00) → 500.00
+        is_negative = False
+        if cleaned.startswith('(') and cleaned.endswith(')'):
+            cleaned = cleaned[1:-1].strip()
+            is_negative = True
+        if cleaned.startswith('-'):
+            cleaned = cleaned[1:].strip()
+            is_negative = True
         # Remove currency symbols: ₹, Rs., INR, USD, $, £, €
-        cleaned = re.sub(r'(?i)(rs\.?|inr|usd|₹|\$|£|€)', '', str(val))
+        cleaned = re.sub(r'(?i)(rs\.?|inr|usd|₹|\$|£|€)', '', cleaned)
         # Remove Dr/Cr suffix (case-insensitive)
         cleaned = re.sub(r'(?i)\s*(dr|cr)\s*$', '', cleaned)
-        # Keep only digits, decimal point, comma (thousands sep), and leading minus
-        cleaned = re.sub(r'[^\d\.,\-]', '', cleaned)
-        # Collapse multiple dots
+        # Remove any whitespace within the number (e.g., "10, 000.00" → "10,000.00")
+        cleaned = re.sub(r'\s+', '', cleaned)
+        # Keep only digits, decimal point, comma (thousands sep)
+        cleaned = re.sub(r'[^\d\.,]', '', cleaned)
+        # Remove commas (Indian lakh format: 1,00,000.00 → 100000.00)
+        cleaned = cleaned.replace(',', '')
+        # Collapse multiple dots — keep only integer.fraction
         if cleaned.count('.') > 1:
             parts = cleaned.split('.')
-            cleaned = '.'.join([parts[0].replace(',', ''), parts[-1]])
-        return cleaned.strip() if cleaned.strip() not in ('', '-', '.') else ""
+            cleaned = parts[0] + '.' + parts[-1]
+        result = cleaned.strip()
+        if result in ('', '.'):
+            return ""
+        # Validate it's actually a number
+        try:
+            float(result)
+        except ValueError:
+            return ""
+        return result
 
     df['debit'] = df['debit'].apply(clean_amount)
     df['credit'] = df['credit'].apply(clean_amount)
     df['balance'] = df['balance'].apply(clean_amount)
 
     if 'description' in df.columns:
-        df['description'] = df['description'].apply(lambda x: x.strip())
+        # Clean up multi-line descriptions
+        df['description'] = df['description'].apply(
+            lambda x: re.sub(r'\s+', ' ', str(x)).strip()
+        )
+
+    # Ensure value_date column exists
+    if 'value_date' not in df.columns:
+        df['value_date'] = df['date'] if 'date' in df.columns else ""
 
     return df.to_dict(orient="records")
 
