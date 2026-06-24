@@ -53,6 +53,16 @@ else:
 # Larger chunks = fewer API calls = lower cost
 GEMINI_CHUNK_SIZE = 40_000
 
+# ── Model Selection (cost-optimized) ──────────────────────────────────────────
+# gemini-2.0-flash-lite: ~10x cheaper than 2.5-flash, perfect for structured extraction
+# gemini-2.5-flash: smarter, used only for categorization where intelligence matters
+GEMINI_EXTRACTION_MODEL = "gemini-2.0-flash-lite"
+GEMINI_SMART_MODEL = "gemini-2.5-flash"
+
+# PDF chunking config for large files
+PDF_CHUNK_PAGES = 15  # pages per chunk when splitting large PDFs
+PDF_CHUNK_THRESHOLD = 15  # split PDFs with more than this many pages
+
 # ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
 class TransactionItem(BaseModel):
@@ -244,6 +254,38 @@ def extract_full_text(pdf_path: str, password: str = None) -> str:
         except Exception as e2:
             print(f"Fallback pdfplumber text extraction failed: {e2}")
             return ""
+
+
+def split_pdf_to_chunks(
+    pdf_path: str,
+    password: str = None,
+    chunk_pages: int = PDF_CHUNK_PAGES,
+) -> List[str]:
+    """
+    Split a large PDF into smaller chunk files of `chunk_pages` pages each.
+    Returns list of temp file paths. Caller must clean up.
+    """
+    import tempfile
+    reader = PdfReader(pdf_path, password=password)
+    total = len(reader.pages)
+    if total <= chunk_pages:
+        return [pdf_path]  # No splitting needed
+
+    chunk_paths = []
+    from pypdf import PdfWriter
+    for start in range(0, total, chunk_pages):
+        end = min(start + chunk_pages, total)
+        writer = PdfWriter()
+        for i in range(start, end):
+            writer.add_page(reader.pages[i])
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_chunk_{start+1}to{end}.pdf")
+        writer.write(tmp)
+        tmp.close()
+        chunk_paths.append(tmp.name)
+        print(f"[PDF Split] Created chunk: pages {start+1}-{end} → {tmp.name}")
+
+    print(f"[PDF Split] Split {total} pages into {len(chunk_paths)} chunks of ~{chunk_pages} pages each")
+    return chunk_paths
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -745,7 +787,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     - Cell value cleanup (newlines, whitespace)
     """
     start_time = time.time()
-    max_pages = 150
+    max_pages = 500
 
     try:
         reader = PdfReader(pdf_path, password=password)
@@ -769,9 +811,9 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
         with pdfplumber.open(pdf_path, password=password) as pdf:
             table_found = False
             for idx, page in enumerate(pdf.pages):
-                # 30s timeout guard
-                if time.time() - start_time > 30.0:
-                    print(f"[Native] Timeout of 30s exceeded at page {idx + 1}/{len(pdf.pages)}. Returning what we have.")
+                # 60s timeout guard
+                if time.time() - start_time > 60.0:
+                    print(f"[Native] Timeout of 60s exceeded at page {idx + 1}/{len(pdf.pages)}. Returning what we have.")
                     break
 
                 if idx >= 3 and not table_found:
@@ -1017,7 +1059,7 @@ def _call_gemini_chunk(
             if GENAI_NEW_SDK:
                 client = model_or_client
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=GEMINI_EXTRACTION_MODEL,
                     contents=user_message,
                     config=genai_types.GenerateContentConfig(
                         system_instruction=system_prompt,
@@ -1106,7 +1148,7 @@ def parse_with_gemini(
     else:
         genai.configure(api_key=GEMINI_API_KEY)
         model_or_client = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
+            model_name=GEMINI_EXTRACTION_MODEL,
             system_instruction=system_prompt,
         )
         print("Using legacy google.generativeai SDK")
@@ -1221,7 +1263,7 @@ def parse_file_directly_with_gemini(
                         raise Exception(f"File state is {state_str}, cannot process.")
 
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=GEMINI_EXTRACTION_MODEL,
                     contents=[uploaded_file, user_message],
                     config=genai_types.GenerateContentConfig(
                         system_instruction=system_prompt,
@@ -1234,7 +1276,7 @@ def parse_file_directly_with_gemini(
             else:
                 genai.configure(api_key=GEMINI_API_KEY)
                 model = genai.GenerativeModel(
-                    model_name="gemini-2.5-flash",
+                    model_name=GEMINI_EXTRACTION_MODEL,
                     system_instruction=system_prompt,
                 )
                 print(f"[Gemini File API] Uploading (legacy): {file_path} (type: {mime_type})")
@@ -1276,6 +1318,21 @@ def parse_file_directly_with_gemini(
                     result.append(txn.model_dump() if hasattr(txn, "model_dump") else dict(txn))
 
             print(f"[Gemini File API] Extracted {len(result)} transactions")
+            
+            # Estimate cost: gemini-2.0-flash-lite rates ($0.075 / 1M input, $0.30 / 1M output)
+            est_pages = 1
+            if mime_type == "application/pdf":
+                try:
+                    reader = PdfReader(file_path)
+                    est_pages = len(reader.pages)
+                except Exception:
+                    pass
+            est_input_tokens = est_pages * 2000
+            est_output_tokens = len(result) * 50
+            est_usd_cost = (est_input_tokens * 0.075 / 1_000_000) + (est_output_tokens * 0.30 / 1_000_000)
+            est_inr_cost = est_usd_cost * 83.5
+            print(f"[Cost Control] Estimated Gemini API cost for direct extraction: ${est_usd_cost:.5f} (approx. Rs. {est_inr_cost:.2f} INR)")
+            
             return result, 1
 
         except Exception as e:
@@ -1308,6 +1365,124 @@ def parse_file_directly_with_gemini(
     return [], 0
 
 
+# ── Chunked PDF Processing for Large Files ────────────────────────────────────
+
+def parse_large_pdf_chunked(
+    file_path: str,
+    mime_type: str,
+    password: str = None,
+    categorize: bool = False,
+    gst: bool = True,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """
+    Split a large PDF into 15-page chunks, process each chunk through Gemini
+    File API in parallel, then merge and deduplicate results.
+    
+    This avoids timeout issues with large PDFs and keeps cost low by using
+    gemini-2.0-flash-lite on small chunks.
+    
+    Returns (transactions, gemini_calls).
+    """
+    if not GEMINI_API_KEY:
+        raise ValueError("GEMINI_API_KEY environment variable is not configured.")
+
+    start_time = time.time()
+    
+    # Split PDF into chunks
+    try:
+        chunk_paths = split_pdf_to_chunks(file_path, password=password, chunk_pages=PDF_CHUNK_PAGES)
+    except Exception as e:
+        print(f"[Chunked] PDF splitting failed: {e} — falling back to direct File API")
+        return parse_file_directly_with_gemini(file_path, mime_type, categorize=categorize, gst=gst)
+
+    is_split = len(chunk_paths) > 1  # Did we actually split?
+    
+    if not is_split:
+        # Small PDF, no splitting needed — process directly
+        return parse_file_directly_with_gemini(file_path, mime_type, categorize=categorize, gst=gst)
+
+    print(f"[Chunked] Processing {len(chunk_paths)} chunks in parallel...")
+
+    all_transactions = []
+    gemini_calls = 0
+    errors = []
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def process_chunk(chunk_idx: int, chunk_path: str):
+        """Process a single PDF chunk through Gemini File API."""
+        try:
+            txns, calls = parse_file_directly_with_gemini(
+                chunk_path,
+                "application/pdf",
+                categorize=categorize,
+                gst=gst,
+            )
+            print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)}: {len(txns)} txns extracted")
+            return txns, calls, None
+        except Exception as e:
+            print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)} failed: {e}")
+            return [], 0, str(e)
+
+    # Process chunks in parallel (max 5 concurrent to avoid rate limits)
+    max_workers = min(len(chunk_paths), 5)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_chunk, i, path): i
+            for i, path in enumerate(chunk_paths)
+        }
+        
+        # Collect results in order
+        chunk_results = [None] * len(chunk_paths)
+        for future in as_completed(futures):
+            idx = futures[future]
+            chunk_results[idx] = future.result()
+
+    # Merge results in order
+    for txns, calls, error in chunk_results:
+        if txns:
+            all_transactions.extend(txns)
+            gemini_calls += calls
+        if error:
+            errors.append(error)
+
+    # Clean up temp chunk files
+    for path in chunk_paths:
+        if path != file_path:  # Don't delete the original
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    # Deduplicate cross-chunk overlaps
+    all_transactions = _deduplicate_transactions(all_transactions)
+
+    elapsed = time.time() - start_time
+    print(f"[Chunked] Done: {len(all_transactions)} txns from {len(chunk_paths)} chunks "
+          f"({gemini_calls} API calls, {elapsed:.1f}s)")
+    
+    # Estimate cost: gemini-2.0-flash-lite rates ($0.075 / 1M input, $0.30 / 1M output)
+    est_pages = len(chunk_paths) * PDF_CHUNK_PAGES
+    est_input_tokens = est_pages * 2000
+    est_output_tokens = len(all_transactions) * 50
+    est_usd_cost = (est_input_tokens * 0.075 / 1_000_000) + (est_output_tokens * 0.30 / 1_000_000)
+    est_inr_cost = est_usd_cost * 83.5
+    print(f"[Cost Control] Estimated Gemini API cost for chunked extraction: ${est_usd_cost:.5f} (approx. Rs. {est_inr_cost:.2f} INR)")
+    
+    if errors:
+        print(f"[Chunked] {len(errors)} chunk(s) had errors: {errors[:3]}")
+
+    # Raise if ALL chunks failed (billing/quota errors)
+    if not all_transactions and errors:
+        # Check if it's a billing/quota issue
+        combined_errors = " ".join(errors).lower()
+        if any(kw in combined_errors for kw in ["dunning", "billing", "permission_denied", "403"]):
+            raise Exception(f"Gemini API billing issue: {errors[0]}")
+        if any(kw in combined_errors for kw in ["429", "quota", "resource_exhausted", "limit"]):
+            raise Exception(f"Gemini API rate limit: {errors[0]}")
+
+    return all_transactions, gemini_calls
+
 # ── Gemini Categorization (post-parse enrichment) ────────────────────────────
 
 def categorize_and_tag_with_gemini(
@@ -1339,7 +1514,7 @@ def categorize_and_tag_with_gemini(
         client = genai.Client(api_key=GEMINI_API_KEY)
     else:
         genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(model_name="gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name=GEMINI_SMART_MODEL)
 
     categorized_items = {}
     gemini_calls = 0
@@ -1351,7 +1526,7 @@ def categorize_and_tag_with_gemini(
             try:
                 if GENAI_NEW_SDK:
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model=GEMINI_SMART_MODEL,
                         contents=user_message,
                         config=genai_types.GenerateContentConfig(
                             system_instruction=system_prompt,

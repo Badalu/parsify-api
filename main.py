@@ -27,9 +27,11 @@ from parser import (
     generate_csv_file,
     categorize_and_tag_with_gemini,
     parse_file_directly_with_gemini,
+    parse_large_pdf_chunked,
     parse_bank_statement_smart,
     is_text_quality_sufficient,
     is_valid_date,
+    PDF_CHUNK_THRESHOLD,
 )
 from supabase import create_client, Client
 
@@ -261,7 +263,7 @@ class DownloadRequest(BaseModel):
 def evaluate_native_confidence(txns: List[dict], page_count: int) -> bool:
     """
     Check if native parse results are good enough to use.
-    Very lenient — we prefer native results over Gemini for speed.
+    Very lenient — we prefer native results over Gemini for speed + cost.
     Only reject when results are clearly garbage.
     """
     if not txns:
@@ -269,23 +271,23 @@ def evaluate_native_confidence(txns: List[dict], page_count: int) -> bool:
         
     total_txns = len(txns)
     
-    # 1. At least SOME transactions — for large PDFs, expect at least ~1 per 3 pages
+    # 1. At least SOME transactions — for large PDFs, expect at least ~1 per 5 pages
     #    For small PDFs (1-3 pages), even 1 txn is fine
-    if page_count > 3 and total_txns < max(1, page_count // 3):
+    if page_count > 3 and total_txns < max(1, page_count // 5):
         print(f"[Native Confidence] Low txn count: {total_txns} for {page_count} pages.")
         return False
         
-    # 2. Check completeness (missing amounts) — allow up to 70% missing
+    # 2. Check completeness (missing amounts) — allow up to 85% missing
     #    Some banks put amount on continuation lines that get merged later
     incomplete_count = sum(1 for t in txns if not str(t.get("debit", "")).strip() and not str(t.get("credit", "")).strip())
-    if total_txns > 2 and incomplete_count > total_txns * 0.7:
+    if total_txns > 2 and incomplete_count > total_txns * 0.85:
         print(f"[Native Confidence] Low completeness: {incomplete_count}/{total_txns} lack amounts.")
         return False
         
-    # 3. Check for valid dates — allow up to 60% invalid
+    # 3. Check for valid dates — allow up to 80% invalid
     #    Dates may have extra whitespace or unusual formats that fail regex
     invalid_dates = sum(1 for t in txns if not is_valid_date(t.get("date", "")))
-    if total_txns > 2 and invalid_dates > total_txns * 0.6:
+    if total_txns > 2 and invalid_dates > total_txns * 0.80:
         print(f"[Native Confidence] Invalid dates: {invalid_dates}/{total_txns} have bad dates.")
         return False
         
@@ -466,8 +468,38 @@ async def convert_statement(
 
             # ── Gemini Fallback — choose strategy based on page count ──
             if not raw_txns:
-                if page_count >= 5:
-                    # Medium/Large PDFs (5+ pages): go directly to File API (faster, single call)
+                if page_count >= PDF_CHUNK_THRESHOLD:
+                    # Large PDFs (15+ pages): chunked parallel processing to avoid timeouts
+                    print(f"[Gemini Chunked] PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {file.filename}")
+                    try:
+                        raw_txns, _g_calls = await asyncio.to_thread(
+                            parse_large_pdf_chunked,
+                            temp_path,
+                            mime_type,
+                            password=password,
+                            categorize=categorize,
+                            gst=gst
+                        )
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                            print(f"[Gemini Chunked] [OK] {len(raw_txns)} transactions extracted via chunked Gemini")
+                    except Exception as e:
+                        print(f"[Gemini Chunked] [ERROR] Chunked processing failed: {e}")
+                        err_msg = str(e).lower()
+                        if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=402,
+                                    detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                                )
+                        if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                            if not low_confidence_txns:
+                                raise HTTPException(
+                                    status_code=429,
+                                    detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
+                                )
+                elif page_count >= 5:
+                    # Medium PDFs (5-14 pages): go directly to File API (faster, single call)
                     print(f"[Gemini File] PDF ({page_count} pages) — using File API directly: {file.filename}")
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
@@ -559,35 +591,67 @@ async def convert_statement(
 
         else:
             # Scanned PDF or Image screenshot: parse directly via Files API multimodal
-            print(f"[Gemini Direct] Parsing scanned PDF or Image directly: {file.filename}")
-            try:
-                raw_txns, _g_calls = await asyncio.to_thread(
-                    parse_file_directly_with_gemini,
-                    temp_path,
-                    mime_type,
-                    categorize=categorize,
-                    gst=gst
-                )
-                if raw_txns:
-                    gemini_used_for_extraction = True
-                    print(f"[Gemini Direct] [OK] {len(raw_txns)} transactions extracted directly")
-            except Exception as e:
-                print(f"[Gemini Direct] [ERROR] Direct parsing failed: {e}")
-                err_msg = str(e).lower()
-                if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
-                    raise HTTPException(
-                        status_code=402,
-                        detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+            if not is_image and page_count >= PDF_CHUNK_THRESHOLD:
+                print(f"[Gemini Chunked Scanned] Scanned PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {file.filename}")
+                try:
+                    raw_txns, _g_calls = await asyncio.to_thread(
+                        parse_large_pdf_chunked,
+                        temp_path,
+                        mime_type,
+                        password=password,
+                        categorize=categorize,
+                        gst=gst
                     )
-                if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                    if raw_txns:
+                        gemini_used_for_extraction = True
+                        print(f"[Gemini Chunked Scanned] [OK] {len(raw_txns)} transactions extracted via chunked Gemini")
+                except Exception as e:
+                    print(f"[Gemini Chunked Scanned] [ERROR] Chunked scanned failed: {e}")
+                    err_msg = str(e).lower()
+                    if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                        raise HTTPException(
+                            status_code=402,
+                            detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                        )
+                    if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                        raise HTTPException(
+                            status_code=429,
+                            detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
+                        )
                     raise HTTPException(
-                        status_code=429,
-                        detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
+                        status_code=500,
+                        detail=f"Failed to parse scanned document: {str(e)}"
                     )
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to parse document: {str(e)}"
-                )
+            else:
+                print(f"[Gemini Direct] Parsing scanned PDF or Image directly: {file.filename}")
+                try:
+                    raw_txns, _g_calls = await asyncio.to_thread(
+                        parse_file_directly_with_gemini,
+                        temp_path,
+                        mime_type,
+                        categorize=categorize,
+                        gst=gst
+                    )
+                    if raw_txns:
+                        gemini_used_for_extraction = True
+                        print(f"[Gemini Direct] [OK] {len(raw_txns)} transactions extracted directly")
+                except Exception as e:
+                    print(f"[Gemini Direct] [ERROR] Direct parsing failed: {e}")
+                    err_msg = str(e).lower()
+                    if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
+                        raise HTTPException(
+                            status_code=402,
+                            detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
+                        )
+                    if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
+                        raise HTTPException(
+                            status_code=429,
+                            detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
+                        )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to parse document: {str(e)}"
+                    )
 
         if not raw_txns:
             raise HTTPException(
@@ -776,8 +840,24 @@ async def convert_batch(
                         pass
 
                 if not raw_txns:
-                    if page_count >= 5:
-                        # Medium/Large PDFs: File API directly
+                    if page_count >= PDF_CHUNK_THRESHOLD:
+                        # Large PDFs (15+ pages): chunked parallel processing
+                        print(f"[Gemini Chunked] Batch PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
+                        try:
+                            raw_txns, _g_calls = await asyncio.to_thread(
+                                parse_large_pdf_chunked,
+                                temp_path,
+                                mime_type,
+                                password=pwd,
+                                categorize=categorize,
+                                gst=gst
+                            )
+                            if raw_txns:
+                                gemini_used_for_extraction = True
+                        except Exception as e:
+                            print(f"[Gemini Chunked] Batch chunked failed for {f.filename}: {e}")
+                    elif page_count >= 5:
+                        # Medium PDFs: File API directly
                         print(f"[Gemini File] Batch PDF ({page_count} pages) — File API: {f.filename}")
                         try:
                             raw_txns, _g_calls = await asyncio.to_thread(
@@ -824,24 +904,45 @@ async def convert_batch(
 
             else:
                 # Scanned PDF or Image screenshot
-                print(f"[Gemini Direct] Batch processing scanned PDF or Image directly: {f.filename}")
-                try:
-                    raw_txns, _g_calls = await asyncio.to_thread(
-                        parse_file_directly_with_gemini,
-                        temp_path,
-                        mime_type,
-                        categorize=categorize,
-                        gst=gst
-                    )
-                    if raw_txns:
-                        gemini_used_for_extraction = True
-                except Exception as e:
-                    print(f"[Gemini Direct] Batch direct parsing failed for {f.filename}: {e}")
-                    err_msg = str(e).lower()
-                    if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
-                        return {"index": idx, "filename": f.filename, "success": False,
-                                "error": "Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status."}
-                    return {"index": idx, "filename": f.filename, "success": False, "error": f"AI parsing failed: {str(e)}"}
+                if not is_image and page_count >= PDF_CHUNK_THRESHOLD:
+                    print(f"[Gemini Chunked Scanned] Batch scanned PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
+                    try:
+                        raw_txns, _g_calls = await asyncio.to_thread(
+                            parse_large_pdf_chunked,
+                            temp_path,
+                            mime_type,
+                            password=pwd,
+                            categorize=categorize,
+                            gst=gst
+                        )
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                    except Exception as e:
+                        print(f"[Gemini Chunked Scanned] Batch chunked scanned failed for {f.filename}: {e}")
+                        err_msg = str(e).lower()
+                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                            return {"index": idx, "filename": f.filename, "success": False,
+                                    "error": "Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status."}
+                        return {"index": idx, "filename": f.filename, "success": False, "error": f"AI parsing failed: {str(e)}"}
+                else:
+                    print(f"[Gemini Direct] Batch processing scanned PDF or Image directly: {f.filename}")
+                    try:
+                        raw_txns, _g_calls = await asyncio.to_thread(
+                            parse_file_directly_with_gemini,
+                            temp_path,
+                            mime_type,
+                            categorize=categorize,
+                            gst=gst
+                        )
+                        if raw_txns:
+                            gemini_used_for_extraction = True
+                    except Exception as e:
+                        print(f"[Gemini Direct] Batch direct parsing failed for {f.filename}: {e}")
+                        err_msg = str(e).lower()
+                        if "dunning" in err_msg or "billing" in err_msg or "permission_denied" in err_msg or "403" in err_msg:
+                            return {"index": idx, "filename": f.filename, "success": False,
+                                    "error": "Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status."}
+                        return {"index": idx, "filename": f.filename, "success": False, "error": f"AI parsing failed: {str(e)}"}
 
             if not raw_txns:
                 return {"index": idx, "filename": f.filename, "success": False,

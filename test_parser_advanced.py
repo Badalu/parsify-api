@@ -139,5 +139,25 @@ class TestParserAdvanced(unittest.TestCase):
         self.assertEqual(txns[1]["date"], "13-05-2023")
         self.assertEqual(txns[1]["credit"], "50000.00")
 
+    @patch("parser.split_pdf_to_chunks")
+    @patch("parser.parse_file_directly_with_gemini")
+    @patch("parser.GEMINI_API_KEY", "dummy_key")
+    def test_parse_large_pdf_chunked_mocked(self, mock_parse_direct, mock_split_pdf):
+        mock_split_pdf.return_value = ["chunk1.pdf", "chunk2.pdf"]
+        
+        # Mock responses from the chunks
+        mock_parse_direct.side_effect = [
+            ([{"date": "12/05/2023", "description": "Txn 1", "debit": "100", "credit": "", "balance": "1000"}], 1),
+            ([{"date": "13/05/2023", "description": "Txn 2", "debit": "", "credit": "200", "balance": "1200"}], 1)
+        ]
+        
+        txns, calls = parser.parse_large_pdf_chunked("large.pdf", "application/pdf")
+        
+        self.assertEqual(len(txns), 2)
+        self.assertEqual(calls, 2)
+        self.assertEqual(txns[0]["description"], "Txn 1")
+        self.assertEqual(txns[1]["description"], "Txn 2")
+        mock_split_pdf.assert_called_once_with("large.pdf", password=None, chunk_pages=parser.PDF_CHUNK_PAGES)
+
 if __name__ == "__main__":
     unittest.main()
