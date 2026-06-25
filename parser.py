@@ -54,10 +54,9 @@ else:
 GEMINI_CHUNK_SIZE = 40_000
 
 # ── Model Selection (cost-optimized) ──────────────────────────────────────────
-# gemini-2.0-flash-lite: ~10x cheaper than 2.5-flash, perfect for structured extraction
-# gemini-2.5-flash: smarter, used only for categorization where intelligence matters
-GEMINI_EXTRACTION_MODEL = "gemini-2.0-flash-lite"
-GEMINI_SMART_MODEL = "gemini-2.5-flash"
+# gemini-3.1-flash-lite: highly cost-effective, perfect for structured extraction and classification
+GEMINI_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
+GEMINI_SMART_MODEL = "gemini-3.1-flash-lite"
 
 # PDF chunking config for large files
 PDF_CHUNK_PAGES = 15  # pages per chunk when splitting large PDFs
@@ -1319,7 +1318,7 @@ def parse_file_directly_with_gemini(
 
             print(f"[Gemini File API] Extracted {len(result)} transactions")
             
-            # Estimate cost: gemini-2.0-flash-lite rates ($0.075 / 1M input, $0.30 / 1M output)
+            # Estimate cost: gemini-3.1-flash-lite rates ($0.25 / 1M input, $1.50 / 1M output)
             est_pages = 1
             if mime_type == "application/pdf":
                 try:
@@ -1329,7 +1328,7 @@ def parse_file_directly_with_gemini(
                     pass
             est_input_tokens = est_pages * 2000
             est_output_tokens = len(result) * 50
-            est_usd_cost = (est_input_tokens * 0.075 / 1_000_000) + (est_output_tokens * 0.30 / 1_000_000)
+            est_usd_cost = (est_input_tokens * 0.25 / 1_000_000) + (est_output_tokens * 1.50 / 1_000_000)
             est_inr_cost = est_usd_cost * 83.5
             print(f"[Cost Control] Estimated Gemini API cost for direct extraction: ${est_usd_cost:.5f} (approx. Rs. {est_inr_cost:.2f} INR)")
             
@@ -1461,11 +1460,11 @@ def parse_large_pdf_chunked(
     print(f"[Chunked] Done: {len(all_transactions)} txns from {len(chunk_paths)} chunks "
           f"({gemini_calls} API calls, {elapsed:.1f}s)")
     
-    # Estimate cost: gemini-2.0-flash-lite rates ($0.075 / 1M input, $0.30 / 1M output)
+    # Estimate cost: gemini-3.1-flash-lite rates ($0.25 / 1M input, $1.50 / 1M output)
     est_pages = len(chunk_paths) * PDF_CHUNK_PAGES
     est_input_tokens = est_pages * 2000
     est_output_tokens = len(all_transactions) * 50
-    est_usd_cost = (est_input_tokens * 0.075 / 1_000_000) + (est_output_tokens * 0.30 / 1_000_000)
+    est_usd_cost = (est_input_tokens * 0.25 / 1_000_000) + (est_output_tokens * 1.50 / 1_000_000)
     est_inr_cost = est_usd_cost * 83.5
     print(f"[Cost Control] Estimated Gemini API cost for chunked extraction: ${est_usd_cost:.5f} (approx. Rs. {est_inr_cost:.2f} INR)")
     
