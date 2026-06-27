@@ -732,7 +732,7 @@ async def convert_batch(
     if quota["tier"] != "subscribed":
         raise HTTPException(
             status_code=403,
-            detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Growth (₹1999), or Pro (₹3400) plan."
+            detail="Bulk conversion is a premium feature. Upgrade to Starter (₹999), Growth (₹1999), or Pro (₹3499) plan."
         )
 
     if quota["units_remaining"] <= 0:
