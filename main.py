@@ -109,8 +109,8 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
-ANON_STMT_LIMIT            = 1    # anonymous users: 1 statement per day
-REGISTERED_STMT_LIMIT      = 2    # free users: 2 statements per day
+ANON_STMT_LIMIT            = 10   # anonymous users: 10 statements/conversions per day
+REGISTERED_STMT_LIMIT      = 15   # free registered users: 15 statements/conversions per day
 STARTER_STMT_LIMIT         = 40   # starter plan: 40 statements/month
 GROWTH_STMT_LIMIT          = 120  # growth plan: 120 statements/month
 PRO_STMT_LIMIT             = 400  # pro plan: 400 statements/month
