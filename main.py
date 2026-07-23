@@ -115,7 +115,7 @@ STARTER_STMT_LIMIT         = 40   # starter plan: 40 statements/month
 GROWTH_STMT_LIMIT          = 120  # growth plan: 120 statements/month
 PRO_STMT_LIMIT             = 400  # pro plan: 400 statements/month
 MAX_BATCH_FILES            = 20   # max files per batch request
-MAX_FILE_SIZE_MB           = 25   # max single file size in MB
+MAX_FILE_SIZE_MB           = 100  # max single file size in MB
 
 
 import httpx
