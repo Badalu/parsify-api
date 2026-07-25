@@ -55,9 +55,10 @@ else:
 GEMINI_CHUNK_SIZE = 40_000
 
 # ── Model Selection (cost-optimized) ──────────────────────────────────────────
-# gemini-2.0-flash: production ready, cost-effective for structured extraction and vision OCR
-GEMINI_EXTRACTION_MODEL = "gemini-2.0-flash"
-GEMINI_SMART_MODEL = "gemini-2.0-flash"
+# gemini-3.1-flash-lite: cheapest active model ($0.25/1M input, $1.50/1M output)
+# gemini-2.0-flash was discontinued on June 1, 2026
+GEMINI_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
+GEMINI_SMART_MODEL = "gemini-3.1-flash-lite"
 
 # PDF chunking config for large files
 PDF_CHUNK_PAGES = 15  # pages per chunk when splitting large PDFs
@@ -1263,7 +1264,7 @@ def parse_file_directly_with_gemini(
 ) -> Tuple[List[Dict[str, Any]], int]:
     """
     Uploads a file (scanned PDF or image) to Gemini File API,
-    parses with Gemini 2.5 Flash, returns (transactions, gemini_calls).
+    parses with Gemini 3.1 Flash-Lite, returns (transactions, gemini_calls).
     Cleans up uploaded file in finally block always.
     """
     if not GEMINI_API_KEY:
@@ -1415,7 +1416,7 @@ def parse_large_pdf_chunked(
     File API in parallel, then merge and deduplicate results.
     
     This avoids timeout issues with large PDFs and keeps cost low by using
-    gemini-2.0-flash-lite on small chunks.
+    gemini-3.1-flash-lite on small chunks.
     
     Returns (transactions, gemini_calls).
     """
