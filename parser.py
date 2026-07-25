@@ -55,9 +55,9 @@ else:
 GEMINI_CHUNK_SIZE = 40_000
 
 # ── Model Selection (cost-optimized) ──────────────────────────────────────────
-# gemini-3.1-flash-lite: highly cost-effective, perfect for structured extraction and classification
-GEMINI_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
-GEMINI_SMART_MODEL = "gemini-3.1-flash-lite"
+# gemini-2.0-flash: production ready, cost-effective for structured extraction and vision OCR
+GEMINI_EXTRACTION_MODEL = "gemini-2.0-flash"
+GEMINI_SMART_MODEL = "gemini-2.0-flash"
 
 # PDF chunking config for large files
 PDF_CHUNK_PAGES = 15  # pages per chunk when splitting large PDFs
@@ -355,7 +355,7 @@ def is_valid_date(val: str) -> bool:
     if not val_str or len(val_str) < 4 or len(val_str) > 25:
         return False
     for pattern in DATE_PATTERNS:
-        if pattern.match(val_str):
+        if pattern.search(val_str):
             return True
     return False
 
@@ -852,8 +852,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                     print(f"[Native] Timeout of 60s exceeded at page {idx + 1}/{len(pdf.pages)}. Returning what we have.")
                     break
 
-                if idx >= 3 and not table_found:
-                    print("[Native] No tables found in first 3 pages. Aborting table extraction.")
+                if idx >= 10 and not table_found:
+                    print("[Native] No tables found in first 10 pages. Aborting native table extraction.")
                     break
 
                 # Try multiple table extraction strategies
