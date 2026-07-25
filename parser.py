@@ -21,7 +21,7 @@ import json
 import time
 import hashlib
 import pdfplumber
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 import pandas as pd
 from typing import List, Dict, Any, Tuple, Optional
 from pydantic import BaseModel, Field
