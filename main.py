@@ -18,6 +18,7 @@ load_dotenv(dotenv_path=env_path)
 
 from parser import (
     check_pdf_basic,
+    decrypt_pdf_if_needed,
     extract_full_text,
     parse_pdf_natively,
     parse_with_gemini,
@@ -355,29 +356,35 @@ async def convert_statement(
             )
 
         is_text_based = False
+        working_path = temp_path
+        is_temp_decrypted = False
+
         if is_image:
             page_count = 1
         else:
+            # ── Check & Decrypt PDF if password protected ──
+            working_path, is_temp_decrypted, is_pwd_invalid = await asyncio.to_thread(
+                decrypt_pdf_if_needed, temp_path, password
+            )
+
+            if is_pwd_invalid:
+                origin = request.headers.get("origin", "*")
+                msg = "Incorrect password for this PDF." if password else "This PDF is password protected. Please enter the password."
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "password_required", "message": msg},
+                    headers={
+                        "Access-Control-Allow-Origin": origin,
+                        "Access-Control-Allow-Credentials": "true",
+                        "Access-Control-Allow-Headers": "*",
+                        "Access-Control-Allow-Methods": "*",
+                    }
+                )
+
             # ── Extract page count & basic text check ──
             try:
-                page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, temp_path, password)
+                page_count, is_text_based = await asyncio.to_thread(check_pdf_basic, working_path, None)
             except Exception as e:
-                err = str(e).lower()
-                err_repr = repr(e).lower()
-                err_type = type(e).__name__.lower()
-                is_pwd_err = any(keyword in (err + err_repr + err_type) for keyword in ["password", "decrypt", "encrypt", "incorrect"])
-                if is_pwd_err:
-                    origin = request.headers.get("origin", "*")
-                    return JSONResponse(
-                        status_code=401,
-                        content={"error": "password_required", "message": "This PDF is password protected. Please enter the password."},
-                        headers={
-                            "Access-Control-Allow-Origin": origin,
-                            "Access-Control-Allow-Credentials": "true",
-                            "Access-Control-Allow-Headers": "*",
-                            "Access-Control-Allow-Methods": "*",
-                        }
-                    )
                 raise HTTPException(status_code=500, detail=f"Could not read PDF: {e}")
 
             if page_count == 0:
@@ -437,7 +444,7 @@ async def convert_statement(
             low_confidence_txns = []
             
             try:
-                raw_txns = await asyncio.to_thread(parse_pdf_natively, temp_path, password)
+                raw_txns = await asyncio.to_thread(parse_pdf_natively, working_path, None)
                 if raw_txns:
                     print(f"[Native] [OK] {len(raw_txns)} transactions extracted natively")
                     if evaluate_native_confidence(raw_txns, page_count):
@@ -452,7 +459,7 @@ async def convert_statement(
             if not raw_txns and not native_success:
                 print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
                 try:
-                    _cached_text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                    _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
                     raw_txns = parse_line_by_line(_cached_text)
                     if raw_txns:
                         print(f"[Native] [OK] {len(raw_txns)} transactions extracted via regex line fallback")
@@ -474,9 +481,9 @@ async def convert_statement(
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
                             parse_large_pdf_chunked,
-                            temp_path,
+                            working_path,
                             mime_type,
-                            password=password,
+                            password=None,
                             categorize=categorize,
                             gst=gst
                         )
@@ -504,7 +511,7 @@ async def convert_statement(
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
                             parse_file_directly_with_gemini,
-                            temp_path,
+                            working_path,
                             mime_type,
                             categorize=categorize,
                             gst=gst
@@ -533,7 +540,7 @@ async def convert_statement(
                     try:
                         # Reuse cached text if already extracted
                         if _cached_text is None:
-                            _cached_text = await asyncio.to_thread(extract_full_text, temp_path, password)
+                            _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
                         raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, _cached_text, categorize=categorize, gst=gst)
                         if raw_txns:
                             gemini_used_for_extraction = True
@@ -560,7 +567,7 @@ async def convert_statement(
                         try:
                             raw_txns, _g_calls = await asyncio.to_thread(
                                 parse_file_directly_with_gemini,
-                                temp_path,
+                                working_path,
                                 mime_type,
                                 categorize=categorize,
                                 gst=gst
@@ -596,9 +603,9 @@ async def convert_statement(
                 try:
                     raw_txns, _g_calls = await asyncio.to_thread(
                         parse_large_pdf_chunked,
-                        temp_path,
+                        working_path,
                         mime_type,
-                        password=password,
+                        password=None,
                         categorize=categorize,
                         gst=gst
                     )
@@ -627,7 +634,7 @@ async def convert_statement(
                 try:
                     raw_txns, _g_calls = await asyncio.to_thread(
                         parse_file_directly_with_gemini,
-                        temp_path,
+                        working_path,
                         mime_type,
                         categorize=categorize,
                         gst=gst
@@ -700,6 +707,8 @@ async def convert_statement(
     finally:
         if os.path.exists(temp_path):
             os.remove(temp_path)
+        if is_temp_decrypted and working_path and os.path.exists(working_path):
+            os.remove(working_path)
 
 
 # ─── Batch Convert ────────────────────────────────────────────────────────────

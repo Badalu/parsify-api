@@ -153,6 +153,42 @@ SYSTEM_PROMPT_CATEGORIZE = (
 )
 
 
+def decrypt_pdf_if_needed(pdf_path: str, password: str = None) -> Tuple[str, bool, bool]:
+    """
+    Checks if PDF is encrypted. If encrypted and password provided, decrypts it into a temp file.
+    Returns (path_to_use, is_temp_file, is_password_invalid).
+    """
+    if not pdf_path.lower().endswith(".pdf"):
+        return pdf_path, False, False
+
+    try:
+        reader = PdfReader(pdf_path, password=password)
+        if reader.is_encrypted:
+            if password:
+                try:
+                    res = reader.decrypt(password)
+                    if res == 0:
+                        return pdf_path, False, True
+                except Exception:
+                    return pdf_path, False, True
+            else:
+                return pdf_path, False, True
+
+            writer = PdfWriter()
+            for page in reader.pages:
+                writer.add_page(page)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix="_decrypted.pdf")
+            writer.write(tmp)
+            tmp.close()
+            return tmp.name, True, False
+        return pdf_path, False, False
+    except Exception as e:
+        err = (str(e) + repr(e) + type(e).__name__).lower()
+        if any(kw in err for kw in ["password", "decrypt", "encrypt", "incorrect"]):
+            return pdf_path, False, True
+        raise e
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PDF BASIC CHECK
 # ══════════════════════════════════════════════════════════════════════════════
