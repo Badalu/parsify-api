@@ -19,6 +19,7 @@ import os
 import re
 import json
 import time
+import tempfile
 import hashlib
 import pdfplumber
 from pypdf import PdfReader, PdfWriter
