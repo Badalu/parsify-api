@@ -661,9 +661,10 @@ async def convert_statement(
                     )
 
         if not raw_txns:
+            err_detail = "No transactions detected in this statement. If the PDF is password-protected, please check that the password is correct." if password else "No transactions detected in this document. Please verify the statement file or select the bank manually."
             raise HTTPException(
                 status_code=422,
-                detail="No transactions detected in this document. Make sure it is a valid Indian bank statement."
+                detail=err_detail
             )
 
         cleaned = clean_and_format_transactions(raw_txns, date_format=date_format)
