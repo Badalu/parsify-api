@@ -32,6 +32,8 @@ from parser import (
     parse_bank_statement_smart,
     is_text_quality_sufficient,
     is_valid_date,
+    detect_bank_name,
+    detect_account_details,
     PDF_CHUNK_THRESHOLD,
 )
 from supabase import create_client, Client
@@ -261,34 +263,43 @@ class DownloadRequest(BaseModel):
     format: str  # "xlsx" or "csv"
 
 
-def evaluate_native_confidence(txns: List[dict], page_count: int) -> bool:
+def evaluate_native_confidence(txns: List[dict], page_count: int, extracted_text: Optional[str] = None) -> bool:
     """
     Check if native parse results are good enough to use.
-    Very lenient — we prefer native results over Gemini for speed + cost.
-    Only reject when results are clearly garbage.
+    Rejects native parse if transaction count is suspiciously low relative to page count or date density.
     """
     if not txns:
         return False
         
     total_txns = len(txns)
     
-    # 1. At least SOME transactions — for large PDFs, expect at least ~1 per 5 pages
-    #    For small PDFs (1-3 pages), even 1 txn is fine
-    if page_count > 3 and total_txns < max(1, page_count // 5):
-        print(f"[Native Confidence] Low txn count: {total_txns} for {page_count} pages.")
-        return False
+    # 1. Page count density check:
+    # Multi-page statements (> 2 pages) should have at least 3.0 txns/page average.
+    if page_count > 2:
+        avg_txns = total_txns / page_count
+        if avg_txns < 3.0:
+            print(f"[Native Confidence] Low txn density: {total_txns} txns for {page_count} pages ({avg_txns:.1f}/page < 3.0). Rejecting native parse.")
+            return False
+
+    # 2. Text date count cross-check if extracted text is provided
+    if extracted_text:
+        date_matches = len(re.findall(
+            r'\b\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\b|\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b',
+            extracted_text
+        ))
+        if date_matches > 20 and total_txns < date_matches * 0.4:
+            print(f"[Native Confidence] Date discrepancy: {total_txns} txns vs {date_matches} dates in text. Rejecting native parse.")
+            return False
         
-    # 2. Check completeness (missing amounts) — allow up to 85% missing
-    #    Some banks put amount on continuation lines that get merged later
+    # 3. Check completeness (missing amounts) — allow up to 60% missing
     incomplete_count = sum(1 for t in txns if not str(t.get("debit", "")).strip() and not str(t.get("credit", "")).strip())
-    if total_txns > 2 and incomplete_count > total_txns * 0.85:
+    if total_txns > 2 and incomplete_count > total_txns * 0.60:
         print(f"[Native Confidence] Low completeness: {incomplete_count}/{total_txns} lack amounts.")
         return False
         
-    # 3. Check for valid dates — allow up to 80% invalid
-    #    Dates may have extra whitespace or unusual formats that fail regex
+    # 4. Check for valid dates
     invalid_dates = sum(1 for t in txns if not is_valid_date(t.get("date", "")))
-    if total_txns > 2 and invalid_dates > total_txns * 0.80:
+    if total_txns > 2 and invalid_dates > total_txns * 0.30:
         print(f"[Native Confidence] Invalid dates: {invalid_dates}/{total_txns} have bad dates.")
         return False
         
@@ -696,10 +707,27 @@ async def convert_statement(
             except Exception as e:
                 print(f"Failed to log anon conversion: {e}")
 
+        # Auto-detect bank and account info
+        detected_bank_name = None
+        account_holder_name = None
+        account_number = None
+        try:
+            sample_text = _cached_text if _cached_text else await asyncio.to_thread(extract_full_text, working_path, None)
+            if sample_text:
+                detected_bank_name = detect_bank_name(sample_text)
+                acc_info = detect_account_details(sample_text)
+                account_holder_name = acc_info.get("account_holder_name")
+                account_number = acc_info.get("account_number")
+        except Exception:
+            pass
+
         return {
             "success": True,
             "filename": file.filename,
             "pages": page_count,
+            "bank_name": detected_bank_name or (bank if bank != "auto" else None),
+            "account_holder_name": account_holder_name,
+            "account_number": account_number,
             "transactions": cleaned,
             "transactions_count": len(cleaned),
             "user_id": user_id_for_log,

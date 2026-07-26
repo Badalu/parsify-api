@@ -61,8 +61,8 @@ GEMINI_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
 GEMINI_SMART_MODEL = "gemini-3.1-flash-lite"
 
 # PDF chunking config for large files
-PDF_CHUNK_PAGES = 15  # pages per chunk when splitting large PDFs
-PDF_CHUNK_THRESHOLD = 15  # split PDFs with more than this many pages
+PDF_CHUNK_PAGES = 10  # pages per chunk when splitting large PDFs
+PDF_CHUNK_THRESHOLD = 10  # split PDFs with more than this many pages
 
 # ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
@@ -189,6 +189,116 @@ def decrypt_pdf_if_needed(pdf_path: str, password: str = None) -> Tuple[str, boo
         if any(kw in err for kw in ["password", "decrypt", "encrypt", "incorrect"]):
             return pdf_path, False, True
         raise e
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BANK NAME AUTO-DETECTION (FREE — zero API calls)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Ordered by specificity: longer/more-specific patterns first to avoid false matches
+_BANK_PATTERNS: List[Tuple[str, List[str]]] = [
+    ("State Bank of India",     ["state bank of india", "sbi ", "onlinesbi", "sbin0"]),
+    ("HDFC Bank",               ["hdfc bank", "hdfcbank", "hdfc ltd"]),
+    ("ICICI Bank",              ["icici bank", "icicibank"]),
+    ("Axis Bank",               ["axis bank", "axisbank"]),
+    ("Kotak Mahindra Bank",     ["kotak mahindra", "kotak bank", "kotakbank"]),
+    ("Punjab National Bank",    ["punjab national bank", "pnb ", "pnbindia"]),
+    ("Bank of Baroda",          ["bank of baroda", "bankofbaroda", "bob "]),
+    ("Canara Bank",             ["canara bank", "canarabank"]),
+    ("Union Bank of India",     ["union bank of india", "unionbank"]),
+    ("IDFC First Bank",         ["idfc first", "idfcfirst", "idfc bank"]),
+    ("IndusInd Bank",           ["indusind bank", "indusind"]),
+    ("Yes Bank",                ["yes bank", "yesbank"]),
+    ("Federal Bank",            ["federal bank", "federalbank"]),
+    ("Bank of India",           ["bank of india"]),
+    ("Indian Bank",             ["indian bank"]),
+    ("Central Bank of India",   ["central bank of india"]),
+    ("Indian Overseas Bank",    ["indian overseas bank", "iob "]),
+    ("UCO Bank",                ["uco bank"]),
+    ("Bank of Maharashtra",     ["bank of maharashtra"]),
+    ("South Indian Bank",       ["south indian bank"]),
+    ("Karur Vysya Bank",        ["karur vysya", "kvb "]),
+    ("City Union Bank",         ["city union bank"]),
+    ("Bandhan Bank",            ["bandhan bank"]),
+    ("IDBI Bank",               ["idbi bank"]),
+    ("RBL Bank",                ["rbl bank", "ratnakar bank"]),
+    ("DBS Bank",                ["dbs bank"]),
+    ("Standard Chartered",      ["standard chartered"]),
+    ("HSBC",                    ["hsbc"]),
+    ("Citibank",                ["citibank", "citi bank"]),
+    ("Deutsche Bank",           ["deutsche bank"]),
+]
+
+
+def detect_bank_name(text: str) -> Optional[str]:
+    """
+    Detect bank name from extracted PDF text using keyword matching.
+    Scans first ~5000 chars (typically first 2 pages) for known bank name patterns.
+    Returns the detected bank name string, or None if not detected.
+    Cost: ₹0 (pure regex/keyword, no API call).
+    """
+    if not text or len(text.strip()) < 10:
+        return None
+
+    # Only scan the first ~5000 chars (first 1-2 pages) for efficiency
+    search_text = text[:5000].lower()
+
+    for bank_name, keywords in _BANK_PATTERNS:
+        for kw in keywords:
+            if kw in search_text:
+                return bank_name
+
+    return None
+
+
+def detect_account_details(text: str) -> Dict[str, Optional[str]]:
+    """
+    Auto-detect account holder name and account number from PDF text.
+    Scans header area (~5000 chars) for standard Indian bank statement fields.
+    """
+    if not text or len(text.strip()) < 10:
+        return {"account_holder_name": None, "account_number": None}
+
+    search_text = text[:5000]
+    holder_name = None
+    account_num = None
+
+    # Account holder name regex patterns
+    holder_patterns = [
+        r'(?i)(?:account\s+name|customer\s+name|account\s+holder\s+name|name\s+of\s+account\s+holder|name\s+of\s+the\s+account\s+holder|client\s+name|holder\s+name|name)\s*[:\-]\s*([A-Za-z\s\.\,\'\-]+)',
+    ]
+
+    for pat in holder_patterns:
+        match = re.search(pat, search_text)
+        if match:
+            candidate = match.group(1).strip()
+            candidate = candidate.split('\n')[0].strip()
+            # Clean up candidate
+            candidate = re.sub(r'\s+', ' ', candidate)
+            skip_words = ["statement", "number", "no", "type", "branch", "period", "date", "address", "ifsc", "page", "account"]
+            if candidate and not any(sw in candidate.lower() for sw in skip_words) and len(candidate) > 2 and len(candidate) < 50:
+                holder_name = candidate.title()
+                break
+
+    # Account number regex patterns
+    acc_patterns = [
+        r'(?i)(?:account\s+no\.?|account\s+number|a/c\s+no\.?|a/c\s+number|account\s+num)\s*[:\-]\s*([X*\d\s\-]+)',
+    ]
+
+    for pat in acc_patterns:
+        match = re.search(pat, search_text)
+        if match:
+            candidate = match.group(1).strip()
+            candidate = candidate.split('\n')[0].strip()
+            candidate = re.sub(r'\s+', '', candidate)
+            if candidate and len(candidate) >= 4 and any(c.isdigit() for c in candidate):
+                account_num = candidate
+                break
+
+    return {
+        "account_holder_name": holder_name,
+        "account_number": account_num,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -929,6 +1039,22 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                         date_val = _safe_get(date_idx, clean_row)
                         desc_val = _safe_get(desc_idx, clean_row)
 
+                        # Smart realignment: if date_val is not valid, check if ANY cell in clean_row is a valid date
+                        if not is_valid_date(date_val):
+                            for c_i, c_val in enumerate(clean_row):
+                                if is_valid_date(c_val):
+                                    date_val = c_val
+                                    offset = c_i - (date_idx if date_idx is not None else 0)
+                                    if desc_idx is not None:
+                                        desc_val = _safe_get(desc_idx + offset, clean_row)
+                                    if debit_idx is not None:
+                                        debit_idx_shifted = debit_idx + offset
+                                    if credit_idx is not None:
+                                        credit_idx_shifted = credit_idx + offset
+                                    if balance_idx is not None:
+                                        balance_idx_shifted = balance_idx + offset
+                                    break
+
                         if not desc_val and not date_val:
                             continue
 
@@ -1145,21 +1271,26 @@ def _call_gemini_chunk(
 
 def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Remove exact duplicate transaction rows using MD5 fingerprint
-    of date + description + debit + credit + balance.
+    Remove exact duplicate transaction rows using MD5 fingerprint with a sliding window.
+    Prevents chunk boundary duplicates while preserving legitimate identical transactions on the same day.
     """
-    seen = set()
+    if not txns:
+        return []
+    seen_recent = []
     result = []
     for txn in txns:
         key = hashlib.md5(
             f"{txn.get('date', '')}__{txn.get('description', '')}__{txn.get('debit', '')}__{txn.get('credit', '')}__{txn.get('balance', '')}".encode()
         ).hexdigest()
-        if key not in seen:
-            seen.add(key)
-            result.append(txn)
+        if key in seen_recent:
+            continue
+        seen_recent.append(key)
+        if len(seen_recent) > 10:
+            seen_recent.pop(0)
+        result.append(txn)
     removed = len(txns) - len(result)
     if removed:
-        print(f"  Deduplication: removed {removed} exact duplicate transactions")
+        print(f"  Deduplication: removed {removed} overlapping duplicate transactions")
     return result
 
 
@@ -1852,7 +1983,32 @@ def parse_bank_statement_smart(
     if total_pages == 0:
         elapsed = time.time() - overall_start
         print(f"[Smart Parse] Empty PDF. Time: {elapsed:.2f}s")
-        return {"transactions": [], "method": "native", "count": 0, "gemini_calls": 0}
+        return {"transactions": [], "method": "native", "count": 0, "gemini_calls": 0, "bank_name": None}
+
+    # ── Auto-detect bank name & account details (FREE — keyword matching on first 2 pages) ──
+    detected_bank = None
+    account_holder_name = None
+    account_number = None
+    try:
+        reader = PdfReader(pdf_path, password=password)
+        first_pages_text = ""
+        for i in range(min(2, len(reader.pages))):
+            page_text = reader.pages[i].extract_text()
+            if page_text:
+                first_pages_text += page_text + "\n"
+        detected_bank = detect_bank_name(first_pages_text)
+        acc_info = detect_account_details(first_pages_text)
+        account_holder_name = acc_info.get("account_holder_name")
+        account_number = acc_info.get("account_number")
+
+        if detected_bank:
+            print(f"[Smart Parse] Bank detected: {detected_bank}")
+        if account_holder_name:
+            print(f"[Smart Parse] Account Holder detected: {account_holder_name}")
+        if account_number:
+            print(f"[Smart Parse] Account Number detected: {account_number}")
+    except Exception as e:
+        print(f"[Smart Parse] Bank/Account detection failed: {e}")
 
     transactions = []
 
@@ -1952,4 +2108,7 @@ def parse_bank_statement_smart(
         "method": method,
         "count": len(transactions),
         "gemini_calls": gemini_calls,
+        "bank_name": detected_bank,
+        "account_holder_name": account_holder_name,
+        "account_number": account_number,
     }
