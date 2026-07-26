@@ -273,13 +273,20 @@ def evaluate_native_confidence(txns: List[dict], page_count: int, extracted_text
         
     total_txns = len(txns)
     
-    # 1. Page count density check:
-    # Multi-page statements (> 2 pages) should have at least 3.0 txns/page average.
+    # 1. Page count density check (tiered thresholds):
+    # - Small/medium PDFs (≤10 pages): 2.0 txns/page (statements often have summary pages)
+    # - Large PDFs (>10 pages): 3.0 txns/page (most pages should be transaction pages)
     if page_count > 2:
+        min_density = 2.0 if page_count <= 10 else 3.0
         avg_txns = total_txns / page_count
-        if avg_txns < 3.0:
-            print(f"[Native Confidence] Low txn density: {total_txns} txns for {page_count} pages ({avg_txns:.1f}/page < 3.0). Rejecting native parse.")
-            return False
+        if avg_txns < min_density:
+            # Rescue: if we found ≥10 txns and ≥70% have valid dates, accept anyway
+            valid_date_count = sum(1 for t in txns if is_valid_date(t.get("date", "")))
+            if total_txns >= 10 and valid_date_count >= total_txns * 0.70:
+                print(f"[Native Confidence] Low density ({avg_txns:.1f}/page < {min_density}) but good date quality ({valid_date_count}/{total_txns}). Accepting.")
+            else:
+                print(f"[Native Confidence] Low txn density: {total_txns} txns for {page_count} pages ({avg_txns:.1f}/page < {min_density}). Rejecting native parse.")
+                return False
 
     # 2. Text date count cross-check if extracted text is provided
     if extracted_text:
@@ -995,6 +1002,20 @@ async def convert_batch(
                 except Exception as e:
                     print(f"[Gemini] Batch categorization failed for {f.filename}: {e}")
 
+            # Auto-detect bank and account info for this file
+            detected_bank_name = None
+            account_holder_name = None
+            account_number = None
+            try:
+                sample_text = _cached_text if _cached_text else await asyncio.to_thread(extract_full_text, temp_path, pwd)
+                if sample_text:
+                    detected_bank_name = detect_bank_name(sample_text)
+                    acc_info = detect_account_details(sample_text)
+                    account_holder_name = acc_info.get("account_holder_name")
+                    account_number = acc_info.get("account_number")
+            except Exception:
+                pass
+
             return {
                 "index": idx,
                 "filename": f.filename,
@@ -1002,6 +1023,9 @@ async def convert_batch(
                 "pages": page_count,
                 "transactions": cleaned,
                 "transactions_count": len(cleaned),
+                "bank_name": detected_bank_name or (bank if bank != "auto" else None),
+                "account_holder_name": account_holder_name,
+                "account_number": account_number,
             }
 
         except Exception as e:

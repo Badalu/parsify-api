@@ -196,59 +196,78 @@ def decrypt_pdf_if_needed(pdf_path: str, password: str = None) -> Tuple[str, boo
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Ordered by specificity: longer/more-specific patterns first to avoid false matches
-_BANK_PATTERNS: List[Tuple[str, List[str]]] = [
-    ("State Bank of India",     ["state bank of india", "sbi ", "onlinesbi", "sbin0"]),
-    ("HDFC Bank",               ["hdfc bank", "hdfcbank", "hdfc ltd"]),
-    ("ICICI Bank",              ["icici bank", "icicibank"]),
-    ("Axis Bank",               ["axis bank", "axisbank"]),
-    ("Kotak Mahindra Bank",     ["kotak mahindra", "kotak bank", "kotakbank"]),
-    ("Punjab National Bank",    ["punjab national bank", "pnb ", "pnbindia"]),
-    ("Bank of Baroda",          ["bank of baroda", "bankofbaroda", "bob "]),
-    ("Canara Bank",             ["canara bank", "canarabank"]),
-    ("Union Bank of India",     ["union bank of india", "unionbank"]),
-    ("IDFC First Bank",         ["idfc first", "idfcfirst", "idfc bank"]),
-    ("IndusInd Bank",           ["indusind bank", "indusind"]),
-    ("Yes Bank",                ["yes bank", "yesbank"]),
-    ("Federal Bank",            ["federal bank", "federalbank"]),
-    ("Bank of India",           ["bank of india"]),
-    ("Indian Bank",             ["indian bank"]),
-    ("Central Bank of India",   ["central bank of india"]),
-    ("Indian Overseas Bank",    ["indian overseas bank", "iob "]),
-    ("UCO Bank",                ["uco bank"]),
-    ("Bank of Maharashtra",     ["bank of maharashtra"]),
-    ("South Indian Bank",       ["south indian bank"]),
-    ("Karur Vysya Bank",        ["karur vysya", "kvb "]),
-    ("City Union Bank",         ["city union bank"]),
-    ("Bandhan Bank",            ["bandhan bank"]),
-    ("IDBI Bank",               ["idbi bank"]),
-    ("RBL Bank",                ["rbl bank", "ratnakar bank"]),
-    ("DBS Bank",                ["dbs bank"]),
-    ("Standard Chartered",      ["standard chartered"]),
-    ("HSBC",                    ["hsbc"]),
-    ("Citibank",                ["citibank", "citi bank"]),
-    ("Deutsche Bank",           ["deutsche bank"]),
+# Each entry: (bank_name, exact_substrings, word_boundary_patterns)
+# exact_substrings: matched with `in` — use for long, unambiguous phrases
+# word_boundary_patterns: matched with regex \b — use for short/ambiguous keywords
+_BANK_PATTERNS: List[Tuple[str, List[str], List[str]]] = [
+    ("State Bank of India",     ["state bank of india", "onlinesbi", "sbin0", "sbininbb"],  [r"\bsbi\b"]),
+    ("HDFC Bank",               ["hdfc bank", "hdfcbank", "hdfc ltd", "hdfc0"],             []),
+    ("ICICI Bank",              ["icici bank", "icicibank", "icic0"],                       []),
+    ("Axis Bank",               ["axis bank", "axisbank", "utib0"],                         []),
+    ("Kotak Mahindra Bank",     ["kotak mahindra", "kotak bank", "kotakbank", "kkbk0"],     []),
+    ("Punjab National Bank",    ["punjab national bank", "pnbindia", "punb0"],              [r"\bpnb\b"]),
+    ("Bank of Baroda",          ["bank of baroda", "bankofbaroda", "barb0"],                [r"\bbob\b"]),
+    ("Canara Bank",             ["canara bank", "canarabank", "cnrb0"],                     []),
+    ("Union Bank of India",     ["union bank of india", "unionbank", "ubin0"],              []),
+    ("IDFC First Bank",         ["idfc first", "idfcfirst", "idfc bank", "idfb0"],          []),
+    ("IndusInd Bank",           ["indusind bank", "indusind", "indb0"],                     []),
+    ("Yes Bank",                ["yes bank", "yesbank", "yesb0"],                           []),
+    ("Federal Bank",            ["federal bank", "federalbank", "fdrl0"],                   []),
+    ("Bank of India",           ["bank of india", "bkid0"],                                 []),
+    ("Indian Bank",             ["indian bank", "idib0"],                                   []),
+    ("Central Bank of India",   ["central bank of india", "cbin0"],                         []),
+    ("Indian Overseas Bank",    ["indian overseas bank"],                                   [r"\biob\b"]),
+    ("UCO Bank",                ["uco bank", "ucba0"],                                      []),
+    ("Bank of Maharashtra",     ["bank of maharashtra", "mahb0"],                           []),
+    ("South Indian Bank",       ["south indian bank", "sibl0"],                             []),
+    ("Karur Vysya Bank",        ["karur vysya"],                                            [r"\bkvb\b"]),
+    ("City Union Bank",         ["city union bank", "ciub0"],                               []),
+    ("Bandhan Bank",            ["bandhan bank", "bdbl0"],                                  []),
+    ("IDBI Bank",               ["idbi bank", "ibkl0"],                                    []),
+    ("RBL Bank",                ["rbl bank", "ratnakar bank", "ratn0"],                     []),
+    ("DBS Bank",                ["dbs bank", "dbss0"],                                      []),
+    ("Standard Chartered",      ["standard chartered", "scbl0"],                            []),
+    ("HSBC",                    ["hsbc"],                                                   []),
+    ("Citibank",                ["citibank", "citi bank", "citi0"],                         []),
+    ("Deutsche Bank",           ["deutsche bank", "deut0"],                                 []),
 ]
 
 
 def detect_bank_name(text: str) -> Optional[str]:
     """
-    Detect bank name from extracted PDF text using keyword matching.
-    Scans first ~5000 chars (typically first 2 pages) for known bank name patterns.
+    Detect bank name from extracted PDF text using keyword matching with scoring.
+    Scans first ~2000 chars (header area only — avoids transaction descriptions).
+    Uses word-boundary regex for short/ambiguous keywords to prevent false positives.
     Returns the detected bank name string, or None if not detected.
     Cost: ₹0 (pure regex/keyword, no API call).
     """
     if not text or len(text.strip()) < 10:
         return None
 
-    # Only scan the first ~5000 chars (first 1-2 pages) for efficiency
-    search_text = text[:5000].lower()
+    # Only scan the first ~2000 chars (header area, NOT transaction descriptions)
+    search_text = text[:2000].lower()
 
-    for bank_name, keywords in _BANK_PATTERNS:
-        for kw in keywords:
+    # Score each bank by number of keyword hits
+    scores: Dict[str, int] = {}
+
+    for bank_name, exact_keywords, boundary_keywords in _BANK_PATTERNS:
+        score = 0
+        for kw in exact_keywords:
             if kw in search_text:
-                return bank_name
+                # Longer keywords get higher score (more specific = more reliable)
+                score += 2 if len(kw) >= 10 else 1
+        for pattern in boundary_keywords:
+            if re.search(pattern, search_text):
+                score += 1
+        if score > 0:
+            scores[bank_name] = score
 
-    return None
+    if not scores:
+        return None
+
+    # Return the bank with the highest score
+    best_bank = max(scores, key=scores.get)
+    return best_bank
 
 
 def detect_account_details(text: str) -> Dict[str, Optional[str]]:
@@ -1821,6 +1840,29 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
         df['description'] = df['description'].apply(
             lambda x: re.sub(r'\s+', ' ', str(x)).strip()
         )
+
+    # ── Filter out junk rows (no valid date AND no debit AND no credit) ──
+    # These are typically header remnants, continuation text lines, or empty rows
+    # that inflate the transaction count incorrectly.
+    def is_valid_row(row):
+        has_date = bool(str(row.get('date', '')).strip())
+        has_debit = bool(str(row.get('debit', '')).strip())
+        has_credit = bool(str(row.get('credit', '')).strip())
+        has_desc = bool(str(row.get('description', '')).strip())
+
+        # A valid transaction must have at least a date or at least one amount
+        if not has_date and not has_debit and not has_credit:
+            return False
+        # Rows with only description but no date and no amounts are continuation text
+        if has_desc and not has_date and not has_debit and not has_credit:
+            return False
+        return True
+
+    before_count = len(df)
+    df = df[df.apply(is_valid_row, axis=1)]
+    filtered_count = before_count - len(df)
+    if filtered_count > 0:
+        print(f"  Cleaned: removed {filtered_count} junk rows (no date + no amounts)")
 
     # Ensure value_date column exists
     if 'value_date' not in df.columns:
