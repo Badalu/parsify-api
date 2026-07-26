@@ -1292,6 +1292,7 @@ def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]
     """
     Remove exact duplicate transaction rows using MD5 fingerprint with a sliding window.
     Prevents chunk boundary duplicates while preserving legitimate identical transactions on the same day.
+    Window size of 20 handles overlap context from chunk boundaries.
     """
     if not txns:
         return []
@@ -1304,7 +1305,7 @@ def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]
         if key in seen_recent:
             continue
         seen_recent.append(key)
-        if len(seen_recent) > 10:
+        if len(seen_recent) > 20:
             seen_recent.pop(0)
         result.append(txn)
     removed = len(txns) - len(result)
@@ -1348,38 +1349,48 @@ def parse_with_gemini(
         gemini_calls = 1
     else:
         # Multi-chunk: split by page breaks, then by size
-        print(f"Large statement ({len(text)} chars), splitting into chunks of {GEMINI_CHUNK_SIZE}...")
+        # Add 500-char overlap from previous chunk to preserve boundary transactions
+        CHUNK_OVERLAP = 500
+        print(f"Large statement ({len(text)} chars), splitting into chunks of {GEMINI_CHUNK_SIZE} with {CHUNK_OVERLAP} char overlap...")
         pages = text.split("\n\n--- Page Break ---\n\n")
 
-        chunks: List[Tuple[int, str]] = []
+        raw_chunks: List[str] = []
         current_chunk = ""
-        chunk_num = 1
 
         for page in pages:
             if len(current_chunk) + len(page) > GEMINI_CHUNK_SIZE and current_chunk:
-                chunks.append((chunk_num, current_chunk))
-                chunk_num += 1
+                raw_chunks.append(current_chunk)
                 current_chunk = page
             else:
                 current_chunk += ("\n\n--- Page Break ---\n\n" if current_chunk else "") + page
 
         if current_chunk:
-            chunks.append((chunk_num, current_chunk))
+            raw_chunks.append(current_chunk)
+
+        # Build final chunks with overlap context from previous chunk
+        chunks: List[Tuple[int, str]] = []
+        for i, chunk_text in enumerate(raw_chunks):
+            if i > 0 and len(raw_chunks[i - 1]) > CHUNK_OVERLAP:
+                # Prepend last 500 chars of previous chunk as context
+                overlap_text = raw_chunks[i - 1][-CHUNK_OVERLAP:]
+                chunk_text = f"[...continuation from previous section...]\n{overlap_text}\n\n--- Page Break ---\n\n{chunk_text}"
+            chunks.append((i + 1, chunk_text))
 
         total_chunks = len(chunks)
-        print(f"  Processing {total_chunks} chunks in parallel...")
+        print(f"  Processing {total_chunks} chunks in parallel (with overlap context)...")
 
         from concurrent.futures import ThreadPoolExecutor
 
         def process_chunk(item):
             c_num, chunk_text = item
             print(f"  Processing chunk {c_num} of {total_chunks}...")
+            context_msg = f"(Chunk {c_num} of {total_chunks} — extract ALL transactions in this section. Some overlap from the previous section may appear at the start — include all transactions, duplicates will be removed automatically.)"
             return _call_gemini_chunk(
                 model_or_client,
                 system_prompt,
                 chunk_text,
                 c_num,
-                f"(Chunk {c_num} of {total_chunks} — process only transactions in this section)",
+                context_msg,
             )
 
         with ThreadPoolExecutor(max_workers=min(total_chunks, 10)) as executor:
@@ -1505,8 +1516,8 @@ def parse_file_directly_with_gemini(
                     result.append(txn.model_dump() if hasattr(txn, "model_dump") else dict(txn))
 
             print(f"[Gemini File API] Extracted {len(result)} transactions")
-            
-            # Estimate cost: gemini-3.1-flash-lite rates ($0.25 / 1M input, $1.50 / 1M output)
+
+            # ── Count validation: retry if significantly fewer transactions than expected ──
             est_pages = 1
             if mime_type == "application/pdf":
                 try:
@@ -1514,6 +1525,23 @@ def parse_file_directly_with_gemini(
                     est_pages = len(reader.pages)
                 except Exception:
                     pass
+
+            # Estimate: typical bank statement has ~8-15 transactions per page
+            # Use conservative estimate of 5 txns/page (excludes summary/header pages)
+            expected_min = max(3, (est_pages - 1) * 5)  # subtract 1 for header/summary page
+            
+            if est_pages >= 3 and len(result) < expected_min * 0.5 and attempt == 0:
+                print(f"[Gemini File API] Count mismatch: got {len(result)} txns but expected ~{expected_min}+ for {est_pages} pages. Retrying with explicit count instruction...")
+                # Don't return — fall through to retry with explicit instruction
+                user_message = (
+                    f"Extract ALL transactions from this bank statement. "
+                    f"This is a {est_pages}-page statement that should contain approximately {expected_min} or more transactions. "
+                    f"Your previous attempt only found {len(result)}. Make sure to extract EVERY SINGLE transaction row. "
+                    f"Do not skip any transactions, do not truncate the output."
+                )
+                continue  # retry with updated user_message
+            
+            # Estimate cost
             est_input_tokens = est_pages * 2000
             est_output_tokens = len(result) * 50
             est_usd_cost = (est_input_tokens * 0.25 / 1_000_000) + (est_output_tokens * 1.50 / 1_000_000)
@@ -1848,15 +1876,18 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
         has_date = bool(str(row.get('date', '')).strip())
         has_debit = bool(str(row.get('debit', '')).strip())
         has_credit = bool(str(row.get('credit', '')).strip())
+        has_balance = bool(str(row.get('balance', '')).strip())
         has_desc = bool(str(row.get('description', '')).strip())
 
-        # A valid transaction must have at least a date or at least one amount
-        if not has_date and not has_debit and not has_credit:
-            return False
-        # Rows with only description but no date and no amounts are continuation text
-        if has_desc and not has_date and not has_debit and not has_credit:
-            return False
-        return True
+        # A row with any monetary amount (debit/credit/balance) is a valid transaction
+        # even if date is empty — some banks put date only on the first line of multi-line entries
+        if has_debit or has_credit:
+            return True
+        # A row with date is valid (even if amounts are empty — could be a zero-amount entry)
+        if has_date and (has_desc or has_balance):
+            return True
+        # Everything else is junk (header remnants, continuation text, empty rows)
+        return False
 
     before_count = len(df)
     df = df[df.apply(is_valid_row, axis=1)]
