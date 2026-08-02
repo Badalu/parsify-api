@@ -532,16 +532,58 @@ def categorize_locally(description: str) -> str:
     return "Other"
 
 
+def extract_gst_details_locally(description: str, debit: str = "", credit: str = "") -> Tuple[str, str, str]:
+    """Returns (gst_tag, gstin_or_details, gst_amount)."""
+    desc = str(description or "")
+    desc_upper = desc.upper()
+
+    # 1. Check 15-character Indian GSTIN pattern (e.g. 27AABCA5544R1ZS)
+    gstin_match = re.search(r'\b\d{2}[A-Z]{5}\d{4}[A-Z]{1}[A-Z0-9]{1}Z[A-Z0-9]{1}\b', desc_upper)
+    gstin_found = gstin_match.group(0) if gstin_match else ""
+
+    # 2. Check GST tags
+    gst_tag = ""
+    if "CGST" in desc_upper and "SGST" in desc_upper:
+        gst_tag = "CGST+SGST"
+    elif "CGST" in desc_upper:
+        gst_tag = "CGST"
+    elif "SGST" in desc_upper:
+        gst_tag = "SGST"
+    elif "IGST" in desc_upper:
+        gst_tag = "IGST"
+    elif "GST" in desc_upper:
+        gst_tag = "GST"
+
+    # 3. Check rate percentage (e.g. 18%, 5%, 12%)
+    rate_match = re.search(r'\b(18|5|12|28|0\.25|3)%\b', desc)
+    rate_str = f" ({rate_match.group(1)}%)" if rate_match else ""
+
+    gst_details = gstin_found if gstin_found else (f"{gst_tag}{rate_str}" if gst_tag else "")
+
+    gst_amount = ""
+    amount_val = debit if debit else credit
+    if amount_val and gst_tag in ("CGST", "SGST", "IGST", "CGST+SGST"):
+        try:
+            amt_num = float(str(amount_val).replace(",", ""))
+            gst_amount = f"₹{amt_num:,.2f}"
+        except ValueError:
+            gst_amount = ""
+    elif amount_val and rate_match:
+        try:
+            amt_num = float(str(amount_val).replace(",", ""))
+            rate_num = float(rate_match.group(1))
+            gst_calc = amt_num * (rate_num / (100 + rate_num))
+            gst_amount = f"₹{gst_calc:,.2f}{rate_str}"
+        except ValueError:
+            gst_amount = ""
+
+    return gst_tag, gst_details, gst_amount
+
+
 def extract_gst_locally(description: str) -> str:
-    """Returns CGST+SGST / IGST / GST / empty string."""
-    desc_lower = str(description).lower()
-    if "cgst" in desc_lower and "sgst" in desc_lower:
-        return "CGST+SGST"
-    elif "igst" in desc_lower:
-        return "IGST"
-    elif "gst" in desc_lower:
-        return "GST"
-    return ""
+    """Returns CGST+SGST / CGST / SGST / IGST / GST / GSTIN / empty string."""
+    gst_tag, gst_details, _ = extract_gst_details_locally(description)
+    return gst_details or gst_tag or ""
 
 
 # ── Header Detection ─────────────────────────────────────────────────────────
@@ -1895,11 +1937,24 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
     if filtered_count > 0:
         print(f"  Cleaned: removed {filtered_count} junk rows (no date + no amounts)")
 
-    # Ensure value_date column exists
-    if 'value_date' not in df.columns:
-        df['value_date'] = df['date'] if 'date' in df.columns else ""
+    # Ensure value_date, gst, gstin, gst_amount columns exist and are populated
+    records = df.to_dict(orient="records")
+    for r in records:
+        if not r.get("value_date"):
+            r["value_date"] = r.get("date", "")
+        desc = r.get("description", "")
+        debit = r.get("debit", "")
+        credit = r.get("credit", "")
+        gst_tag, gst_details, gst_amount = extract_gst_details_locally(desc, debit, credit)
 
-    return df.to_dict(orient="records")
+        if not r.get("gst") or r.get("gst") in ("—", "-", "None", "null", ""):
+            r["gst"] = gst_details or gst_tag or ""
+        if not r.get("gstin") or r.get("gstin") in ("—", "-", "None", "null", ""):
+            r["gstin"] = gst_details or r.get("gst") or ""
+        if not r.get("gst_amount") or r.get("gst_amount") in ("—", "-", "None", "null", ""):
+            r["gst_amount"] = gst_amount or (r.get("gst") if r.get("gst") else "")
+
+    return records
 
 
 def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
