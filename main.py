@@ -35,6 +35,7 @@ from parser import (
     detect_bank_name,
     detect_account_details,
     PDF_CHUNK_THRESHOLD,
+    reconcile_and_heal_transactions,
 )
 from supabase import create_client, Client
 
@@ -728,6 +729,9 @@ async def convert_statement(
         except Exception:
             pass
 
+        # ── 99.9% Mathematical Reconciliation & Self-Healing ──
+        cleaned, audit = reconcile_and_heal_transactions(cleaned)
+
         return {
             "success": True,
             "filename": file.filename,
@@ -737,6 +741,7 @@ async def convert_statement(
             "account_number": account_number,
             "transactions": cleaned,
             "transactions_count": len(cleaned),
+            "reconciliation": audit,
             "user_id": user_id_for_log,
         }
 
@@ -1016,6 +1021,9 @@ async def convert_batch(
             except Exception:
                 pass
 
+            # ── 99.9% Mathematical Reconciliation & Self-Healing ──
+            cleaned, audit = reconcile_and_heal_transactions(cleaned)
+
             return {
                 "index": idx,
                 "filename": f.filename,
@@ -1023,6 +1031,7 @@ async def convert_batch(
                 "pages": page_count,
                 "transactions": cleaned,
                 "transactions_count": len(cleaned),
+                "reconciliation": audit,
                 "bank_name": detected_bank_name or (bank if bank != "auto" else None),
                 "account_holder_name": account_holder_name,
                 "account_number": account_number,

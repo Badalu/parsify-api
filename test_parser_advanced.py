@@ -159,5 +159,42 @@ class TestParserAdvanced(unittest.TestCase):
         self.assertEqual(txns[1]["description"], "Txn 2")
         mock_split_pdf.assert_called_once_with("large.pdf", password=None, chunk_pages=parser.PDF_CHUNK_PAGES)
 
+    def test_reconciliation_standard_and_healing(self):
+        # 1. Standard perfectly reconciled statement
+        txns = [
+            {"date": "01/04/2026", "description": "Opening Txn", "debit": "", "credit": "10000.00", "balance": "10000.00"},
+            {"date": "02/04/2026", "description": "ATM Withdrawal", "debit": "2000.00", "credit": "", "balance": "8000.00"},
+            {"date": "03/04/2026", "description": "Salary Deposit", "debit": "", "credit": "50000.00", "balance": "58000.00"},
+            {"date": "04/04/2026", "description": "Rent Payment", "debit": "15000.00", "credit": "", "balance": "43000.00"},
+        ]
+        healed, audit = parser.reconcile_and_heal_transactions(txns)
+        self.assertTrue(audit["is_reconciled"])
+        self.assertEqual(audit["status"], "VERIFIED")
+        self.assertEqual(audit["accuracy_score"], 99.9)
+        self.assertEqual(audit["closing_balance"], 43000.00)
+
+        # 2. Self-healing: Inverted columns (Debit and Credit globally swapped)
+        inverted_txns = [
+            {"date": "01/04/2026", "description": "Opening Txn", "debit": "10000.00", "credit": "", "balance": "10000.00"},
+            {"date": "02/04/2026", "description": "ATM Withdrawal", "debit": "", "credit": "2000.00", "balance": "8000.00"},
+            {"date": "03/04/2026", "description": "Salary Deposit", "debit": "50000.00", "credit": "", "balance": "58000.00"},
+            {"date": "04/04/2026", "description": "Rent Payment", "debit": "", "credit": "15000.00", "balance": "43000.00"},
+        ]
+        healed_inv, audit_inv = parser.reconcile_and_heal_transactions(inverted_txns)
+        self.assertTrue(audit_inv["columns_swapped"])
+        self.assertEqual(healed_inv[1]["debit"], "2000.00")
+        self.assertEqual(healed_inv[2]["credit"], "50000.00")
+        self.assertTrue(audit_inv["is_reconciled"])
+
+        # 3. Self-healing: OCR missing decimal point (e.g. 50000 instead of 500.00)
+        decimal_error_txns = [
+            {"date": "01/04/2026", "description": "Opening", "debit": "", "credit": "5000.00", "balance": "5000.00"},
+            {"date": "02/04/2026", "description": "Coffee (decimal lost: 50000 -> 500.00)", "debit": "50000", "credit": "", "balance": "4500.00"},
+        ]
+        healed_dec, audit_dec = parser.reconcile_and_heal_transactions(decimal_error_txns)
+        self.assertEqual(healed_dec[1]["debit"], "500.00")
+        self.assertEqual(healed_dec[1].get("math_healed"), "fixed_decimal_factor_100")
+        self.assertTrue(audit_dec["is_reconciled"])
+
 if __name__ == "__main__":
     unittest.main()
