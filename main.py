@@ -461,7 +461,12 @@ async def convert_statement(
                 raw_txns = await asyncio.to_thread(parse_pdf_natively, working_path, None)
                 if raw_txns:
                     print(f"[Native] [OK] {len(raw_txns)} transactions extracted natively")
-                    if evaluate_native_confidence(raw_txns, page_count):
+                    if _cached_text is None and page_count > 2:
+                        try:
+                            _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
+                        except Exception:
+                            pass
+                    if evaluate_native_confidence(raw_txns, page_count, _cached_text):
                         native_success = True
                     else:
                         print(f"[Native] [WARN] Low confidence natively. Saving as fallback.")
@@ -473,11 +478,12 @@ async def convert_statement(
             if not raw_txns and not native_success:
                 print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
                 try:
-                    _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
+                    if _cached_text is None:
+                        _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
                     raw_txns = parse_line_by_line(_cached_text)
                     if raw_txns:
                         print(f"[Native] [OK] {len(raw_txns)} transactions extracted via regex line fallback")
-                        if evaluate_native_confidence(raw_txns, page_count):
+                        if evaluate_native_confidence(raw_txns, page_count, _cached_text):
                             native_success = True
                         else:
                             print(f"[Native] [WARN] Low confidence line-by-line. Saving as fallback.")
@@ -489,9 +495,9 @@ async def convert_statement(
 
             # ── Gemini Fallback — choose strategy based on page count ──
             if not raw_txns:
-                if page_count >= PDF_CHUNK_THRESHOLD:
-                    # Large PDFs (15+ pages): chunked parallel processing to avoid timeouts
-                    print(f"[Gemini Chunked] PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {file.filename}")
+                if page_count > PDF_CHUNK_THRESHOLD:
+                    # Multi-page PDFs (>3 pages): chunked parallel processing to avoid token truncation & extract 100%
+                    print(f"[Gemini Chunked] PDF ({page_count} pages > {PDF_CHUNK_THRESHOLD}) — using chunked processing: {file.filename}")
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
                             parse_large_pdf_chunked,
@@ -519,9 +525,9 @@ async def convert_statement(
                                     status_code=429,
                                     detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
                                 )
-                elif page_count >= 5:
-                    # Medium PDFs (5-14 pages): go directly to File API (faster, single call)
-                    print(f"[Gemini File] PDF ({page_count} pages) — using File API directly: {file.filename}")
+                else:
+                    # Small PDFs (1-3 pages): try File API directly, then text fallback
+                    print(f"[Gemini File] Small PDF ({page_count} pages) — using File API directly: {file.filename}")
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
                             parse_file_directly_with_gemini,
@@ -548,49 +554,19 @@ async def convert_statement(
                                     status_code=429,
                                     detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
                                 )
-                else:
-                    # Small PDFs (<5 pages): try text chunks first (cheaper)
-                    print(f"[Gemini] Fallback text parsing starting: {file.filename}")
-                    try:
-                        # Reuse cached text if already extracted
-                        if _cached_text is None:
-                            _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
-                        raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, _cached_text, categorize=categorize, gst=gst)
-                        if raw_txns:
-                            gemini_used_for_extraction = True
-                            print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via text fallback")
-                    except Exception as e:
-                        print(f"[Gemini] [ERROR] Text fallback failed: {e}")
-                        err_msg = str(e).lower()
-                        if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
-                            if not low_confidence_txns:
-                                raise HTTPException(
-                                    status_code=402,
-                                    detail="Gemini AI API Key has a billing issue. Please check your Google Cloud Billing status or update your API key."
-                                )
-                        if any(kw in err_msg for kw in ["429", "quota", "resource_exhausted", "limit"]):
-                            if not low_confidence_txns:
-                                raise HTTPException(
-                                    status_code=429,
-                                    detail="Gemini AI API rate limit or daily quota exceeded. Please upgrade to a paid API key or configure billing in Google AI Studio."
-                                )
 
-                    # Small PDF File API fallback if text chunks also failed
+                    # Small PDF text fallback if File API failed
                     if not raw_txns:
-                        print(f"[Gemini File] Final fallback — uploading full PDF: {file.filename}")
+                        print(f"[Gemini] Fallback text parsing starting: {file.filename}")
                         try:
-                            raw_txns, _g_calls = await asyncio.to_thread(
-                                parse_file_directly_with_gemini,
-                                working_path,
-                                mime_type,
-                                categorize=categorize,
-                                gst=gst
-                            )
+                            if _cached_text is None:
+                                _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
+                            raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, _cached_text, categorize=categorize, gst=gst)
                             if raw_txns:
                                 gemini_used_for_extraction = True
-                                print(f"[Gemini File] [OK] {len(raw_txns)} transactions extracted via File API fallback")
+                                print(f"[Gemini] [OK] {len(raw_txns)} transactions extracted via text fallback")
                         except Exception as e:
-                            print(f"[Gemini File] [ERROR] File API fallback also failed: {e}")
+                            print(f"[Gemini] [ERROR] Text fallback failed: {e}")
                             err_msg = str(e).lower()
                             if any(kw in err_msg for kw in ["dunning", "billing", "permission_denied", "403"]):
                                 if not low_confidence_txns:
@@ -885,9 +861,9 @@ async def convert_batch(
                         pass
 
                 if not raw_txns:
-                    if page_count >= PDF_CHUNK_THRESHOLD:
-                        # Large PDFs (15+ pages): chunked parallel processing
-                        print(f"[Gemini Chunked] Batch PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
+                    if page_count > PDF_CHUNK_THRESHOLD:
+                        # Multi-page PDFs (>3 pages): chunked parallel processing to avoid token truncation
+                        print(f"[Gemini Chunked] Batch PDF ({page_count} pages > {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
                         try:
                             raw_txns, _g_calls = await asyncio.to_thread(
                                 parse_large_pdf_chunked,
@@ -901,8 +877,8 @@ async def convert_batch(
                                 gemini_used_for_extraction = True
                         except Exception as e:
                             print(f"[Gemini Chunked] Batch chunked failed for {f.filename}: {e}")
-                    elif page_count >= 5:
-                        # Medium PDFs: File API directly
+                    else:
+                        # Small PDFs (1-3 pages): File API directly, then text fallback
                         print(f"[Gemini File] Batch PDF ({page_count} pages) — File API: {f.filename}")
                         try:
                             raw_txns, _g_calls = await asyncio.to_thread(
@@ -914,33 +890,18 @@ async def convert_batch(
                                 gemini_used_for_extraction = True
                         except Exception as e:
                             print(f"[Gemini File] Batch File API failed for {f.filename}: {e}")
-                    else:
-                        # Small PDFs: text chunks first
-                        print(f"[Gemini] Fallback text parsing for batch file: {f.filename}")
-                        try:
-                            if _cached_text is None:
-                                _cached_text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
-                            raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, _cached_text, categorize=categorize, gst=gst)
-                            if raw_txns:
-                                gemini_used_for_extraction = True
-                        except Exception as e:
-                            print(f"[Gemini] Batch text fallback failed for {f.filename}: {e}")
 
-                # Gemini File API fallback for batch
-                if not raw_txns:
-                    print(f"[Gemini File] Final fallback for batch file: {f.filename}")
-                    try:
-                        raw_txns, _g_calls = await asyncio.to_thread(
-                            parse_file_directly_with_gemini,
-                            temp_path,
-                            mime_type,
-                            categorize=categorize,
-                            gst=gst
-                        )
-                        if raw_txns:
-                            gemini_used_for_extraction = True
-                    except Exception as e:
-                        print(f"[Gemini File] Batch File API fallback failed for {f.filename}: {e}")
+                        # Small PDF text fallback
+                        if not raw_txns:
+                            print(f"[Gemini] Fallback text parsing for batch file: {f.filename}")
+                            try:
+                                if _cached_text is None:
+                                    _cached_text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
+                                raw_txns, _g_calls = await asyncio.to_thread(parse_with_gemini, _cached_text, categorize=categorize, gst=gst)
+                                if raw_txns:
+                                    gemini_used_for_extraction = True
+                            except Exception as e:
+                                print(f"[Gemini] Batch text fallback failed for {f.filename}: {e}")
 
                 # Rescue low confidence native txns if all Gemini paths failed
                 if not raw_txns and low_confidence_txns:
@@ -949,8 +910,8 @@ async def convert_batch(
 
             else:
                 # Scanned PDF or Image screenshot
-                if not is_image and page_count >= PDF_CHUNK_THRESHOLD:
-                    print(f"[Gemini Chunked Scanned] Batch scanned PDF ({page_count} pages >= {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
+                if not is_image and page_count > PDF_CHUNK_THRESHOLD:
+                    print(f"[Gemini Chunked Scanned] Batch scanned PDF ({page_count} pages > {PDF_CHUNK_THRESHOLD}) — using chunked processing: {f.filename}")
                     try:
                         raw_txns, _g_calls = await asyncio.to_thread(
                             parse_large_pdf_chunked,

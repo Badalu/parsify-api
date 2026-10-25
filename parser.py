@@ -60,9 +60,9 @@ GEMINI_CHUNK_SIZE = 40_000
 GEMINI_EXTRACTION_MODEL = "gemini-3.1-flash-lite"
 GEMINI_SMART_MODEL = "gemini-3.1-flash-lite"
 
-# PDF chunking config for large files
-PDF_CHUNK_PAGES = 10  # pages per chunk when splitting large PDFs
-PDF_CHUNK_THRESHOLD = 10  # split PDFs with more than this many pages
+# PDF chunking config for large files (3 pages = ~75 transactions = ~5,000 tokens, perfectly avoids truncation)
+PDF_CHUNK_PAGES = 3  # pages per chunk when splitting large PDFs
+PDF_CHUNK_THRESHOLD = 3  # split PDFs with more than 3 pages
 
 # ── Pydantic Schemas for Structured Gemini Output ─────────────────────────────
 
@@ -1008,6 +1008,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
 
     transactions: List[Dict[str, Any]] = []
     header_mapping: Dict[str, int] = {}
+    pages_with_txns = set()
+    completed_all_pages = False
 
     # Table settings to try: default first, then text-based for borderless tables
     table_settings_list = [
@@ -1017,20 +1019,26 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
 
     try:
         with pdfplumber.open(pdf_path, password=password) as pdf:
+            total_pdf_pages = len(pdf.pages)
             table_found = False
+            preferred_setting_idx = None
+            last_parsed_idx = -1
+
             for idx, page in enumerate(pdf.pages):
-                # 60s timeout guard
-                if time.time() - start_time > 60.0:
-                    print(f"[Native] Timeout of 60s exceeded at page {idx + 1}/{len(pdf.pages)}. Returning what we have.")
+                last_parsed_idx = idx
+                # 180s timeout guard (extended for large multi-page statements)
+                if time.time() - start_time > 180.0:
+                    print(f"[Native] Timeout of 180s reached at page {idx + 1}/{total_pdf_pages}.")
                     break
 
                 if idx >= 10 and not table_found:
                     print("[Native] No tables found in first 10 pages. Aborting native table extraction.")
                     break
 
-                # Try multiple table extraction strategies
+                # Try preferred table extraction strategy first if one already worked
+                settings_to_try = [table_settings_list[preferred_setting_idx]] if preferred_setting_idx is not None else table_settings_list
                 tables = []
-                for settings in table_settings_list:
+                for s_i, settings in enumerate(settings_to_try):
                     try:
                         if settings:
                             extracted = page.extract_tables(table_settings=settings)
@@ -1038,12 +1046,14 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                             extracted = page.extract_tables()
                         if extracted:
                             tables = extracted
+                            if preferred_setting_idx is None:
+                                preferred_setting_idx = s_i
                             break
                     except Exception:
                         continue
 
-                # Fallback to find_tables
-                if not tables:
+                # Fallback to find_tables only if no tables found yet
+                if not tables and not table_found:
                     try:
                         found = page.find_tables()
                         if found:
@@ -1194,6 +1204,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                 "gst": extract_gst_locally(desc_val),
                             }
                             transactions.append(txn)
+                            pages_with_txns.add(idx)
 
                         elif desc_val and not date_val and transactions:
                             desc_lower = desc_val.lower()
@@ -1209,6 +1220,20 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                                     transactions[-1]["balance"] = clean_row[balance_idx]
 
                 page.flush_cache()
+
+            if last_parsed_idx == total_pdf_pages - 1:
+                completed_all_pages = True
+
+        # Incomplete parse guard: if native timed out or broke early, DO NOT return partial transactions!
+        # Returning partial transactions causes users to receive truncated statements.
+        if total_pdf_pages > 1 and not completed_all_pages:
+            print(f"[Native] Incomplete parse: stopped at page {last_parsed_idx + 1}/{total_pdf_pages}. Rejecting partial result to allow full chunked processing.")
+            return []
+
+        # Coverage guard: if multi-page (>= 4 pages) and transactions were found on fewer than 40% of pages, tables were missed!
+        if total_pdf_pages >= 4 and len(pages_with_txns) < max(2, int(total_pdf_pages * 0.40)):
+            print(f"[Native] Insufficient page coverage: txns found on only {len(pages_with_txns)} of {total_pdf_pages} pages. Rejecting partial result to allow full chunked processing.")
+            return []
 
         # If table extraction yielded nothing, try line-by-line regex fallback
         if not transactions:
@@ -1258,6 +1283,28 @@ def _strip_markdown_fences(raw: str) -> str:
     return raw.strip()
 
 
+def _clean_and_parse_json(raw: str) -> dict:
+    """
+    Clean markdown fences and parse JSON.
+    Auto-salvages truncated JSON if Gemini reached output token limit.
+    """
+    cleaned = _strip_markdown_fences(raw).strip()
+    try:
+        return json.loads(cleaned)
+    except Exception as initial_err:
+        try:
+            last_brace = cleaned.rfind("}")
+            if last_brace != -1:
+                salvaged_text = cleaned[:last_brace + 1].rstrip().rstrip(",") + "\n]}"
+                data = json.loads(salvaged_text)
+                if isinstance(data, dict) and "transactions" in data and isinstance(data["transactions"], list):
+                    print(f"  [JSON Repair] Successfully salvaged {len(data['transactions'])} transactions from truncated output!")
+                    return data
+        except Exception:
+            pass
+        raise initial_err
+
+
 def _call_gemini_chunk(
     model_or_client,
     system_prompt: str,
@@ -1290,6 +1337,7 @@ def _call_gemini_chunk(
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
                         temperature=0,
+                        max_output_tokens=65536,
                     ),
                 )
             else:
@@ -1300,11 +1348,11 @@ def _call_gemini_chunk(
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
                         temperature=0,
+                        max_output_tokens=65536,
                     ),
                 )
 
-            raw = _strip_markdown_fences(response.text)
-            data = json.loads(raw)
+            data = _clean_and_parse_json(response.text)
             txns = data.get("transactions", [])
             print(f"  Chunk {chunk_num}: Extracted {len(txns)} transactions")
             return txns
@@ -1332,24 +1380,38 @@ def _call_gemini_chunk(
 
 def _deduplicate_transactions(txns: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Remove exact duplicate transaction rows using MD5 fingerprint with a sliding window.
-    Prevents chunk boundary duplicates while preserving legitimate identical transactions on the same day.
-    Window size of 20 handles overlap context from chunk boundaries.
+    Remove true duplicate transaction rows (e.g., chunk boundary overlap).
+    Preserves legitimate identical transactions on the same day (e.g., multiple identical UPI payments).
     """
     if not txns:
         return []
-    seen_recent = []
     result = []
+    seen_with_balance = set()
     for txn in txns:
-        key = hashlib.md5(
-            f"{txn.get('date', '')}__{txn.get('description', '')}__{txn.get('debit', '')}__{txn.get('credit', '')}__{txn.get('balance', '')}".encode()
-        ).hexdigest()
-        if key in seen_recent:
-            continue
-        seen_recent.append(key)
-        if len(seen_recent) > 20:
-            seen_recent.pop(0)
-        result.append(txn)
+        bal = str(txn.get("balance", "")).strip()
+        date = str(txn.get("date", "")).strip()
+        desc = str(txn.get("description", "")).strip()
+        deb = str(txn.get("debit", "")).strip()
+        cred = str(txn.get("credit", "")).strip()
+
+        if bal:
+            # When balance is present, exact match on balance+date+desc+amounts is a duplicate
+            key = f"{date}|{desc}|{deb}|{cred}|{bal}"
+            if key in seen_with_balance:
+                continue
+            seen_with_balance.add(key)
+            result.append(txn)
+        else:
+            # When balance is empty, only remove if directly consecutive identical row (overlap artifact)
+            if result:
+                prev = result[-1]
+                if (date == str(prev.get("date", "")).strip() and
+                    desc == str(prev.get("description", "")).strip() and
+                    deb == str(prev.get("debit", "")).strip() and
+                    cred == str(prev.get("credit", "")).strip()):
+                    continue
+            result.append(txn)
+
     removed = len(txns) - len(result)
     if removed:
         print(f"  Deduplication: removed {removed} overlapping duplicate transactions")
@@ -1510,6 +1572,7 @@ def parse_file_directly_with_gemini(
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
                         temperature=0,
+                        max_output_tokens=65536,
                     ),
                 )
                 raw = response.text
@@ -1541,12 +1604,12 @@ def parse_file_directly_with_gemini(
                         response_mime_type="application/json",
                         response_schema=TransactionsList,
                         temperature=0,
+                        max_output_tokens=65536,
                     ),
                 )
                 raw = response.text
 
-            raw = _strip_markdown_fences(raw)
-            data = json.loads(raw)
+            data = _clean_and_parse_json(raw)
             txns = data.get("transactions", [])
 
             # Normalize
@@ -1667,19 +1730,27 @@ def parse_large_pdf_chunked(
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def process_chunk(chunk_idx: int, chunk_path: str):
-        """Process a single PDF chunk through Gemini File API."""
-        try:
-            txns, calls = parse_file_directly_with_gemini(
-                chunk_path,
-                "application/pdf",
-                categorize=categorize,
-                gst=gst,
-            )
-            print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)}: {len(txns)} txns extracted")
-            return txns, calls, None
-        except Exception as e:
-            print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)} failed: {e}")
-            return [], 0, str(e)
+        """Process a single PDF chunk through Gemini File API with retries."""
+        chunk_retries = 2
+        for attempt in range(chunk_retries):
+            try:
+                txns, calls = parse_file_directly_with_gemini(
+                    chunk_path,
+                    "application/pdf",
+                    categorize=categorize,
+                    gst=gst,
+                )
+                print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)}: {len(txns)} txns extracted")
+                return txns, calls, None
+            except Exception as e:
+                print(f"[Chunked] Chunk {chunk_idx + 1}/{len(chunk_paths)} attempt {attempt + 1} failed: {e}")
+                err_lower = str(e).lower()
+                if any(kw in err_lower for kw in ["dunning", "billing", "permission_denied", "403"]):
+                    return [], 0, str(e)
+                if attempt < chunk_retries - 1:
+                    time.sleep(2)
+                else:
+                    return [], 0, str(e)
 
     # Process chunks in parallel (max 5 concurrent to avoid rate limits)
     max_workers = min(len(chunk_paths), 5)
@@ -1694,6 +1765,24 @@ def parse_large_pdf_chunked(
         for future in as_completed(futures):
             idx = futures[future]
             chunk_results[idx] = future.result()
+
+    # Sequential recovery for any chunk that failed during parallel processing
+    for idx, res in enumerate(chunk_results):
+        if res is None or (not res[0] and res[2]):
+            print(f"[Chunked] Retrying failed chunk {idx + 1}/{len(chunk_paths)} sequentially...")
+            try:
+                time.sleep(2)
+                retry_txns, retry_calls = parse_file_directly_with_gemini(
+                    chunk_paths[idx],
+                    "application/pdf",
+                    categorize=categorize,
+                    gst=gst,
+                )
+                if retry_txns:
+                    chunk_results[idx] = (retry_txns, retry_calls, None)
+                    print(f"[Chunked] Sequential recovery for chunk {idx + 1} succeeded: {len(retry_txns)} txns extracted")
+            except Exception as retry_err:
+                print(f"[Chunked] Sequential recovery for chunk {idx + 1} failed: {retry_err}")
 
     # Merge results in order
     for txns, calls, error in chunk_results:
@@ -1711,7 +1800,7 @@ def parse_large_pdf_chunked(
             except Exception:
                 pass
 
-    # Deduplicate cross-chunk overlaps
+    # Deduplicate boundary overlaps safely
     all_transactions = _deduplicate_transactions(all_transactions)
 
     elapsed = time.time() - start_time
@@ -2364,16 +2453,26 @@ def parse_bank_statement_smart(
 
     transactions = []
 
-    # ── Step 2: SCANNED → Gemini File API directly ──
+    # ── Step 2: SCANNED → Gemini File API / Chunked (OCR) ──
     if not is_text_based:
-        print("[Smart Parse] Scanned PDF detected → Gemini File API (OCR)")
+        print("[Smart Parse] Scanned PDF detected → Gemini OCR")
         method = "gemini_file"
-        transactions, g_calls = parse_file_directly_with_gemini(
-            pdf_path,
-            "application/pdf",
-            categorize=(categorize and use_gemini_categorize),
-            gst=gst,
-        )
+        if total_pages > PDF_CHUNK_THRESHOLD:
+            print(f"[Smart Parse] Multi-page scanned PDF ({total_pages} pages > {PDF_CHUNK_THRESHOLD}) → chunked parsing")
+            transactions, g_calls = parse_large_pdf_chunked(
+                pdf_path,
+                "application/pdf",
+                password=password,
+                categorize=(categorize and use_gemini_categorize),
+                gst=gst,
+            )
+        else:
+            transactions, g_calls = parse_file_directly_with_gemini(
+                pdf_path,
+                "application/pdf",
+                categorize=(categorize and use_gemini_categorize),
+                gst=gst,
+            )
         gemini_calls += g_calls
 
     else:
@@ -2411,15 +2510,25 @@ def parse_bank_statement_smart(
                 )
                 gemini_calls += g_calls
             else:
-                # ── Step 7: Text quality poor → Gemini File API ──
+                # ── Step 7: Text quality poor → Gemini File API / Chunked ──
                 print("[Smart Parse] Text quality poor → Gemini File API")
                 method = "gemini_file"
-                transactions, g_calls = parse_file_directly_with_gemini(
-                    pdf_path,
-                    "application/pdf",
-                    categorize=(categorize and use_gemini_categorize),
-                    gst=gst,
-                )
+                if total_pages > PDF_CHUNK_THRESHOLD:
+                    print(f"[Smart Parse] Multi-page statement ({total_pages} pages > {PDF_CHUNK_THRESHOLD}) → chunked parsing")
+                    transactions, g_calls = parse_large_pdf_chunked(
+                        pdf_path,
+                        "application/pdf",
+                        password=password,
+                        categorize=(categorize and use_gemini_categorize),
+                        gst=gst,
+                    )
+                else:
+                    transactions, g_calls = parse_file_directly_with_gemini(
+                        pdf_path,
+                        "application/pdf",
+                        categorize=(categorize and use_gemini_categorize),
+                        gst=gst,
+                    )
                 gemini_calls += g_calls
 
     # ── Local categorization (FREE, default) ──
