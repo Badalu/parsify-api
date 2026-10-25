@@ -220,14 +220,15 @@ def get_user_quota(user: dict) -> dict:
             if c_res.status_code == 200:
                 units_used = len(c_res.json())
         else:
-            # Free user: count statements consumed TODAY
+            # Free user: count PAGES consumed TODAY (daily 15-page limit)
             c_url = (
-                f"{SUPABASE_URL}/rest/v1/conversions?select=id"
+                f"{SUPABASE_URL}/rest/v1/conversions?select=pages"
                 f"&user_id=eq.{user['id']}&created_at=gte.{today_start}"
             )
             c_res = httpx.get(c_url, headers=headers)
             if c_res.status_code == 200:
-                units_used = len(c_res.json())
+                rows = c_res.json()
+                units_used = sum(r.get("pages") or 1 for r in rows)
     except Exception as e:
         print(f"Error fetching conversions: {e}")
 
