@@ -196,8 +196,11 @@ def get_user_quota(user: dict) -> dict:
 
     IST = timezone(timedelta(hours=5, minutes=30))
     now_ist = datetime.now(IST)
-    month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-    today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    today_midnight_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = today_midnight_ist.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    month_midnight_ist = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    month_start = month_midnight_ist.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
         if tier == "subscribed":
@@ -213,6 +216,7 @@ def get_user_quota(user: dict) -> dict:
                 units_used = 0
     except Exception as e:
         print(f"[Quota] Error fetching conversions: {e}")
+        units_used = credits_limit  # Fail closed to prevent free bypass if query errors
 
     units_remaining = max(0, credits_limit - units_used)
 
@@ -403,7 +407,8 @@ async def convert_statement(
             
             if supabase:
                 IST = timezone(timedelta(hours=5, minutes=30))
-                today_start = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+                now_ist = datetime.now(IST)
+                today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 
                 res = await asyncio.to_thread(
                     lambda: supabase.table("conversions").select("id").eq("user_id", x_anon_id).gte("created_at", today_start).execute()
