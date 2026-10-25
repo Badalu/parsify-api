@@ -153,47 +153,41 @@ async def verify_user(authorization: Optional[str] = Header(None)) -> Optional[d
 #   Paid (subscribed): statement-based — 1 statement consumed per conversion
 #                      regardless of page count (40/120/400 per month)
 def get_user_quota(user: dict) -> dict:
-    if not SUPABASE_URL:
+    tier = "registered"
+    expiry_str = None
+    credits_limit = REGISTERED_STMT_LIMIT
+    units_used = 0
+    expired = False
+
+    if not supabase:
+        print("[Quota] WARNING: Supabase client not initialized")
         return {
             "tier": "registered",
             "credits_limit": REGISTERED_STMT_LIMIT,
-            "units_used": 0,
-            "units_remaining": REGISTERED_STMT_LIMIT,
+            "units_used": REGISTERED_STMT_LIMIT, # fail closed to prevent free bypass
+            "units_remaining": 0,
             "is_statement_based": True,
             "expired": False,
-            # Legacy aliases kept for backward-compat:
-            "pages_used": 0,
-            "pages_remaining": REGISTERED_STMT_LIMIT,
+            "pages_used": REGISTERED_STMT_LIMIT,
+            "pages_remaining": 0,
         }
 
-    headers = {
-        "apikey": os.getenv("SUPABASE_PUBLISHABLE_KEY") or SUPABASE_KEY,
-        "Authorization": f"Bearer {user['token']}",
-    }
-
-    tier = "registered"
-    expiry_str = None
-    credits_limit = REGISTERED_STMT_LIMIT  # will be overridden for subscribed
-
     try:
-        # Query 1: Profile
-        url = f"{SUPABASE_URL}/rest/v1/profiles?select=tier,premium_expiry_date,credits&id=eq.{user['id']}"
-        res = httpx.get(url, headers=headers)
-        if res.status_code == 200 and res.json():
-            profile = res.json()[0]
-            tier = profile.get("tier", "registered")
+        # 1. Fetch Profile
+        p_res = supabase.table("profiles").select("tier, premium_expiry_date, credits").eq("id", user["id"]).execute()
+        if p_res.data and len(p_res.data) > 0:
+            profile = p_res.data[0]
+            tier = profile.get("tier") or "registered"
             expiry_str = profile.get("premium_expiry_date")
-            # credits column stores statement-limit for paid, page-limit for free
             raw_credits = profile.get("credits")
             if tier == "subscribed":
                 credits_limit = raw_credits if raw_credits else STARTER_STMT_LIMIT
             else:
                 credits_limit = REGISTERED_STMT_LIMIT
     except Exception as e:
-        print(f"Error fetching profile: {e}")
+        print(f"[Quota] Error fetching profile: {e}")
 
-    # Check expiry
-    expired = False
+    # Check expiry for subscribed users
     if tier == "subscribed" and expiry_str:
         if expiry_str < datetime.now(timezone.utc).isoformat():
             tier = "registered"
@@ -205,43 +199,32 @@ def get_user_quota(user: dict) -> dict:
     month_start = now_ist.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
-    # ── Usage counting depends on tier ──
-    is_statement_based = True
-    units_used = 0
-
     try:
         if tier == "subscribed":
-            # Count number of conversions (1 statement = 1 unit) THIS MONTH
-            c_url = (
-                f"{SUPABASE_URL}/rest/v1/conversions?select=id"
-                f"&user_id=eq.{user['id']}&created_at=gte.{month_start}"
-            )
-            c_res = httpx.get(c_url, headers=headers)
-            if c_res.status_code == 200:
-                units_used = len(c_res.json())
+            # Paid user: count statements used this month
+            c_res = supabase.table("conversions").select("id").eq("user_id", user["id"]).gte("created_at", month_start).execute()
+            units_used = len(c_res.data) if c_res.data else 0
         else:
-            # Free user: count PAGES consumed TODAY (daily 15-page limit)
-            c_url = (
-                f"{SUPABASE_URL}/rest/v1/conversions?select=pages"
-                f"&user_id=eq.{user['id']}&created_at=gte.{today_start}"
-            )
-            c_res = httpx.get(c_url, headers=headers)
-            if c_res.status_code == 200:
-                rows = c_res.json()
-                units_used = sum(r.get("pages") or 1 for r in rows)
+            # Free user: count sum of pages consumed today (daily 15-page limit)
+            c_res = supabase.table("conversions").select("pages").eq("user_id", user["id"]).gte("created_at", today_start).execute()
+            if c_res.data:
+                units_used = sum(r.get("pages") or 1 for r in c_res.data)
+            else:
+                units_used = 0
     except Exception as e:
-        print(f"Error fetching conversions: {e}")
+        print(f"[Quota] Error fetching conversions: {e}")
 
     units_remaining = max(0, credits_limit - units_used)
+
+    print(f"[Quota] User {user.get('email')} ({user['id']}) - Tier: {tier}, Used: {units_used}/{credits_limit}, Remaining: {units_remaining}")
 
     return {
         "tier": tier,
         "credits_limit": credits_limit,
         "units_used": units_used,
         "units_remaining": units_remaining,
-        "is_statement_based": is_statement_based,
+        "is_statement_based": (tier == "subscribed"),
         "expired": expired,
-        # Legacy aliases (pages) for backward compat with frontend
         "pages_used": units_used,
         "pages_remaining": units_remaining,
     }
@@ -450,8 +433,14 @@ async def convert_statement(
                 else:
                     raise HTTPException(
                         status_code=403,
-                        detail=f"Free daily quota exhausted. You have used your {REGISTERED_STMT_LIMIT} statements today. Register/upgrade to get more conversions."
+                        detail=f"Daily free limit reached. You have used all {quota['credits_limit']} free pages today. Upgrade your plan to convert this statement."
                     )
+
+            if quota["tier"] != "subscribed" and page_count > quota["units_remaining"]:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Daily limit exceeded. This statement has {page_count} pages, but you only have {quota['units_remaining']} free pages left today. Upgrade your plan to convert this statement."
+                )
 
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
         raw_txns = []
