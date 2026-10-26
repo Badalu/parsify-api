@@ -476,17 +476,39 @@ _DATE_CLEANUP_RE = re.compile(r'[\n\r\t]+')
 
 
 def is_valid_date(val: str) -> bool:
-    """Regex check for DD/MM/YYYY, DD-MM-YY, DD Mon YYYY, YYYY-MM-DD etc."""
+    """Regex check for DD/MM/YYYY, DD-MM-YY, DD Mon YYYY, YYYY-MM-DD etc., including timestamps."""
     if not val:
         return False
     val_str = str(val).strip()
-    # Clean up newlines/tabs that pdfplumber sometimes leaves in cell values
     val_str = _DATE_CLEANUP_RE.sub(' ', val_str).strip()
-    if not val_str or len(val_str) < 4 or len(val_str) > 25:
+    if not val_str or len(val_str) < 4:
         return False
+
+    # Regex allowing date + optional timestamp / AM/PM (e.g. 12/05/2023 15:30:12 or 12-May-2023 10:20 AM)
+    date_regex = re.compile(
+        r'^\s*('
+        r'\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|'
+        r'\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4}|'
+        r'\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}|'
+        r'[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{2,4}|'
+        r'\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}'
+        r')(?:\s*[\s\(,]\s*\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?\)?|\s*[AaPp][Mm])?\s*$'
+    )
+    if date_regex.match(val_str):
+        return True
+
+    # Check against standard DATE_PATTERNS
     for pattern in DATE_PATTERNS:
         if pattern.search(val_str):
             return True
+
+    # Substring search if string is short enough to be a date cell
+    m = re.search(r'\b\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\b|\b\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4}\b|\b\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}\b', val_str)
+    if m:
+        digits_only = re.sub(r'[^\d]', '', val_str)
+        if len(digits_only) <= 14:
+            return True
+
     return False
 
 
@@ -604,9 +626,7 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
     date_kws = ["date", "dt", "txn d", "trans d", "posting d", "post d", "trn d"]
     desc_kws = [
         "particulars", "description", "narration", "naration", "remarks",
-        "transaction details", "transaction", "transactions", "details",
-        "narrative", "desc", "party name", "beneficiary", "payee",
-        "tran", "trans", "chq", "cheque", "ref", "reference"
+        "transaction details", "details", "narrative", "desc", "party name", "beneficiary", "payee"
     ]
     debit_kws = ["debit", "withdrawal", "payment", "withdraw", "withdrawal(dr)", "withdrawal amt", "dr amount"]
     credit_kws = ["credit", "deposit", "receipt", "deposit(cr)", "deposit amt", "cr amount"]
@@ -618,20 +638,23 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
         if not cell:
             continue
 
+        is_date_col = any(kw in cell for kw in date_kws)
+        is_bal_col = any(kw in cell for kw in balance_kws)
+
         # Date columns
-        if any(kw in cell for kw in date_kws):
+        if is_date_col:
             if "value" in cell or "val" in cell or "clearing" in cell:
                 mapping["value_date"] = idx
             else:
-                if "date" not in mapping:  # take the first date column found
+                if "date" not in mapping:
                     mapping["date"] = idx
 
-        # Description columns
-        if any(kw in cell for kw in desc_kws):
-            if "description" not in mapping:  # take the first description column
+        # Description columns (must NOT be a date column)
+        if (any(kw in cell for kw in desc_kws) or ("transaction" in cell and not is_date_col) or ("tran" in cell and not is_date_col)):
+            if "description" not in mapping and not is_date_col:
                 mapping["description"] = idx
 
-        # Debit columns — but NOT if the cell is just "dr" or "cr" alone (that's dr_cr column)
+        # Debit columns
         if any(kw in cell for kw in debit_kws):
             if cell not in ("dr", "cr", "d", "c", "dr/cr", "cr/dr", "type", "d/c"):
                 mapping["debit"] = idx
@@ -646,13 +669,13 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
             if not any(skip in cell for skip in ["debit", "credit", "payment", "deposit", "withdraw", "dr", "cr"]):
                 mapping["amount"] = idx
 
-        # Dr/Cr type column
-        if any(kw in cell for kw in dr_cr_kws) or cell in ["dr", "cr", "d/c", "type"]:
-            mapping["dr_cr"] = idx
-
         # Balance columns
-        if any(kw in cell for kw in balance_kws):
+        if is_bal_col:
             mapping["balance"] = idx
+
+        # Dr/Cr type column (must NOT be balance column)
+        if (any(kw in cell for kw in dr_cr_kws) or cell in ["dr", "cr", "d/c", "type"]) and not is_bal_col:
+            mapping["dr_cr"] = idx
 
     # Fallback if date is not found but value_date is
     if "date" not in mapping and "value_date" in mapping:
@@ -1130,39 +1153,60 @@ def _parse_pdf_page_slice(
                         eff_balance_idx = (balance_idx + offset) if (balance_idx is not None and offset) else balance_idx
                         eff_val_date_idx = (val_date_idx + offset) if (val_date_idx is not None and offset) else val_date_idx
 
-                        if is_valid_date(date_val):
-                            debit_val = _safe_get(eff_debit_idx, clean_row)
-                            credit_val = _safe_get(eff_credit_idx, clean_row)
+                        debit_val = _safe_get(eff_debit_idx, clean_row)
+                        credit_val = _safe_get(eff_credit_idx, clean_row)
+                        balance_val = _safe_get(eff_balance_idx, clean_row)
+                        val_date_val = _safe_get(eff_val_date_idx, clean_row)
 
-                            if not debit_val and not credit_val and amount_idx is not None:
-                                amt_val = _safe_get(amount_idx + offset, clean_row)
-                                type_val = _safe_get(dr_cr_idx + offset if dr_cr_idx is not None else None, clean_row).lower().strip()
+                        if not debit_val and not credit_val and amount_idx is not None:
+                            amt_val = _safe_get(amount_idx + offset, clean_row)
+                            type_val = _safe_get(dr_cr_idx + offset if dr_cr_idx is not None else None, clean_row).lower().strip()
 
-                                if "dr" in type_val or type_val == "d":
-                                    debit_val = amt_val
-                                elif "cr" in type_val or type_val == "c":
-                                    credit_val = amt_val
+                            if "dr" in type_val or type_val == "d":
+                                debit_val = amt_val
+                            elif "cr" in type_val or type_val == "c":
+                                credit_val = amt_val
+                            else:
+                                amt_lower = amt_val.lower() if amt_val else ""
+                                if amt_val and amt_val.startswith("-"):
+                                    debit_val = amt_val.lstrip("-")
+                                elif "dr" in amt_lower:
+                                    debit_val = re.sub(r'(?i)\s*dr\s*$', '', amt_val)
+                                elif "cr" in amt_lower:
+                                    credit_val = re.sub(r'(?i)\s*cr\s*$', '', amt_val)
+                                elif amt_val and amt_val.startswith("(") and amt_val.endswith(")"):
+                                    debit_val = amt_val[1:-1]
                                 else:
-                                    amt_lower = amt_val.lower() if amt_val else ""
-                                    if amt_val and amt_val.startswith("-"):
-                                        debit_val = amt_val.lstrip("-")
-                                    elif "dr" in amt_lower:
-                                        debit_val = re.sub(r'(?i)\s*dr\s*$', '', amt_val)
-                                    elif "cr" in amt_lower:
-                                        credit_val = re.sub(r'(?i)\s*cr\s*$', '', amt_val)
-                                    elif amt_val and amt_val.startswith("(") and amt_val.endswith(")"):
-                                        debit_val = amt_val[1:-1]
+                                    if desc_val and any(kw in desc_val.lower() for kw in [
+                                        "payment", "withdrawal", "debit", "upi to", "neft to",
+                                        "paid", "emi", "loan"
+                                    ]):
+                                        debit_val = amt_val
                                     else:
-                                        if desc_val and any(kw in desc_val.lower() for kw in [
-                                            "payment", "withdrawal", "debit", "upi to", "neft to",
-                                            "paid", "emi", "loan"
-                                        ]):
-                                            debit_val = amt_val
-                                        else:
-                                            credit_val = amt_val
+                                        credit_val = amt_val
 
-                            balance_val = _safe_get(eff_balance_idx, clean_row)
-                            val_date_val = _safe_get(eff_val_date_idx, clean_row)
+                        # SAME-DAY TRANSACTION INHERITANCE:
+                        # If date_val is not a valid date, but the row contains an amount (debit or credit),
+                        # and we already have a previous transaction, inherit previous date!
+                        if not is_valid_date(date_val) and (debit_val or credit_val) and txns:
+                            date_val = txns[-1]["date"]
+                            if not val_date_val:
+                                val_date_val = txns[-1].get("value_date") or date_val
+
+                        if not desc_val and not date_val:
+                            continue
+
+                        combined_lower = (str(date_val) + " " + str(desc_val)).lower()
+                        if any(sw in combined_lower for sw in [
+                            "opening balance", "closing balance", "balance brought",
+                            "balance carried", "total", "grand total", "statement generated"
+                        ]):
+                            continue
+
+                        if is_valid_date(date_val):
+                            # Clean timestamp from date_val
+                            m_d = re.search(r'\b(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4})\b|\b(\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4})\b|\b(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})\b', str(date_val))
+                            clean_date_val = m_d.group(0) if m_d else str(date_val)
 
                             if amount_idx is None:
                                 if (eff_val_date_idx is not None and val_date_val
@@ -1173,7 +1217,7 @@ def _parse_pdf_page_slice(
                                     credit_val = _safe_get(eff_debit_idx, clean_row)
                                     debit_val = _safe_get(desc_idx, clean_row)
                                     desc_val = val_date_val
-                                    val_date_val = date_val
+                                    val_date_val = clean_date_val
 
                                 if debit_val and re.search(r'[A-Za-z]{3,}', debit_val) and "dr" not in debit_val.lower():
                                     desc_val += " " + debit_val
@@ -1182,8 +1226,8 @@ def _parse_pdf_page_slice(
                                     balance_val = clean_row[eff_balance_idx + 1] if eff_balance_idx is not None and eff_balance_idx + 1 < len(clean_row) else ""
 
                             txn = {
-                                "date": date_val,
-                                "value_date": val_date_val if val_date_val else date_val,
+                                "date": clean_date_val,
+                                "value_date": val_date_val if val_date_val else clean_date_val,
                                 "description": desc_val,
                                 "debit": debit_val,
                                 "credit": credit_val,
@@ -1194,18 +1238,19 @@ def _parse_pdf_page_slice(
                             txns.append(txn)
                             pages_with_txns.add(idx)
 
-                        elif desc_val and not date_val and txns:
-                            desc_lower = desc_val.lower()
-                            skip_words = ["balance", "carried", "brought", "total", "page", "statement"]
-                            if not any(sw in desc_lower for sw in skip_words):
-                                txns[-1]["description"] += " " + desc_val
-
-                                if eff_debit_idx is not None and eff_debit_idx < len(clean_row) and clean_row[eff_debit_idx] and not txns[-1]["debit"]:
-                                    txns[-1]["debit"] = clean_row[eff_debit_idx]
-                                if eff_credit_idx is not None and eff_credit_idx < len(clean_row) and clean_row[eff_credit_idx] and not txns[-1]["credit"]:
-                                    txns[-1]["credit"] = clean_row[eff_credit_idx]
-                                if eff_balance_idx is not None and eff_balance_idx < len(clean_row) and clean_row[eff_balance_idx] and not txns[-1]["balance"]:
-                                    txns[-1]["balance"] = clean_row[eff_balance_idx]
+                        elif txns:
+                            # Continuation text row (no date and no amounts) -> append narration
+                            cont_parts = [
+                                str(c).strip() for c_i, c in enumerate(clean_row)
+                                if c and str(c).strip() and c_i not in (eff_debit_idx, eff_credit_idx, eff_balance_idx)
+                                and not is_valid_date(str(c))
+                            ]
+                            if cont_parts:
+                                cont_str = " ".join(cont_parts)
+                                desc_lower = cont_str.lower()
+                                skip_words = ["balance", "carried", "brought", "total", "page", "statement"]
+                                if not any(sw in desc_lower for sw in skip_words):
+                                    txns[-1]["description"] += " " + cont_str
 
                 page.flush_cache()
     except Exception as e:
@@ -1242,7 +1287,8 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     deadline = start_time + timeout_duration
 
     table_settings_list = [
-        {},  # default pdfplumber settings
+        {},  # default pdfplumber settings (explicit lines)
+        {"vertical_strategy": "text", "horizontal_strategy": "lines"},  # horizontal lines (Yes Bank, HDFC, ICICI)
         {"vertical_strategy": "text", "horizontal_strategy": "text"},  # borderless
     ]
 
@@ -2093,6 +2139,15 @@ def clean_and_format_transactions(txns: List[Dict[str, Any]], date_format: str =
     df['debit'] = df['debit'].apply(clean_amount)
     df['credit'] = df['credit'].apply(clean_amount)
     df['balance'] = df['balance'].apply(clean_amount)
+
+    if 'date' in df.columns:
+        def clean_date_str(val):
+            if not val:
+                return ""
+            s = str(val).strip()
+            m = re.search(r'\b(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4})\b|\b(\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4})\b|\b(\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})\b', s)
+            return m.group(0) if m else s
+        df['date'] = df['date'].apply(clean_date_str)
 
     if 'description' in df.columns:
         # Clean up multi-line descriptions
