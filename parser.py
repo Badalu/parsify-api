@@ -2733,3 +2733,120 @@ def parse_bank_statement_smart(
         "account_number": account_number,
         "reconciliation": reconciliation_audit,
     }
+
+
+def generate_excel_file(txns: List[Dict[str, Any]], file_path: str):
+    """
+    Create a highly styled, professional Excel worksheet from transactions list using pandas and openpyxl.
+    """
+    if not txns:
+        df = pd.DataFrame(columns=["Date", "Value Date", "Description", "Debit", "Credit", "Balance", "Category", "GST"])
+        df.to_excel(file_path, index=False)
+        return
+
+    df = pd.DataFrame(txns)
+
+    cols = ["date", "value_date", "description", "debit", "credit", "balance", "category", "gst"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols]
+
+    rename_dict = {
+        "date": "Date",
+        "value_date": "Value Date",
+        "description": "Description",
+        "debit": "Debit",
+        "credit": "Credit",
+        "balance": "Balance",
+        "category": "Category",
+        "gst": "GST"
+    }
+    df = df.rename(columns=rename_dict)
+
+    with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+        df.to_excel(writer, sheet_name="Transactions", index=False)
+
+        workbook = writer.book
+        worksheet = writer.sheets["Transactions"]
+
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from openpyxl.utils import get_column_letter
+
+        header_fill = PatternFill(start_color="4F46E5", end_color="4F46E5", fill_type="solid")
+        header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
+
+        zebra_fill = PatternFill(start_color="F8FAFC", end_color="F8FAFC", fill_type="solid")
+        border_side = Side(border_style="thin", color="E2E8F0")
+        thin_border = Border(left=border_side, right=border_side, top=border_side, bottom=border_side)
+
+        cell_font = Font(name="Segoe UI", size=10)
+
+        for col_idx in range(1, len(df.columns) + 1):
+            cell = worksheet.cell(row=1, column=col_idx)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center" if col_idx != 3 else "left", vertical="center")
+            cell.border = thin_border
+
+        for row_idx in range(2, worksheet.max_row + 1):
+            is_zebra = (row_idx % 2 == 0)
+            for col_idx in range(1, len(df.columns) + 1):
+                cell = worksheet.cell(row=row_idx, column=col_idx)
+                cell.font = cell_font
+                cell.border = thin_border
+
+                if is_zebra:
+                    cell.fill = zebra_fill
+
+                col_name = df.columns[col_idx - 1]
+                if col_name in ["Debit", "Credit", "Balance"]:
+                    cell.alignment = Alignment(horizontal="right", vertical="center")
+                    try:
+                        val_str = str(cell.value).replace(",", "")
+                        if val_str and val_str not in ("—", "None", ""):
+                            cell.value = float(val_str)
+                            cell.number_format = '#,##0.00'
+                    except ValueError:
+                        pass
+                elif col_name in ["Date", "Value Date"]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                else:
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+
+        for col in worksheet.columns:
+            max_len = 0
+            col_letter = get_column_letter(col[0].column)
+            for cell in col:
+                val_str = str(cell.value or "")
+                if len(val_str) > max_len:
+                    max_len = len(val_str)
+            worksheet.column_dimensions[col_letter].width = min(max(max_len + 4, 12), 50)
+
+        worksheet.row_dimensions[1].height = 28
+        for r in range(2, worksheet.max_row + 1):
+            worksheet.row_dimensions[r].height = 20
+
+
+def generate_csv_file(txns: List[Dict[str, Any]], file_path: str):
+    """
+    Generate standard CSV file from transactions list.
+    """
+    if not txns:
+        with open(file_path, "w", encoding="utf-8-sig") as f:
+            f.write("Date,Value Date,Description,Debit,Credit,Balance,Category,GST\n")
+        return
+    df = pd.DataFrame(txns)
+    cols = ["date", "value_date", "description", "debit", "credit", "balance", "category", "gst"]
+    cols = [c for c in cols if c in df.columns]
+    df = df[cols]
+    rename_dict = {
+        "date": "Date",
+        "value_date": "Value Date",
+        "description": "Description",
+        "debit": "Debit",
+        "credit": "Credit",
+        "balance": "Balance",
+        "category": "Category",
+        "gst": "GST"
+    }
+    df = df.rename(columns=rename_dict)
+    df.to_csv(file_path, index=False, encoding='utf-8-sig')
