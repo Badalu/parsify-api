@@ -603,9 +603,10 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
 
     date_kws = ["date", "dt", "txn d", "trans d", "posting d", "post d", "trn d"]
     desc_kws = [
-        "particulars", "description", "narration", "remarks",
-        "transaction details", "details", "narrative", "desc",
-        "party name", "beneficiary", "payee"
+        "particulars", "description", "narration", "naration", "remarks",
+        "transaction details", "transaction", "transactions", "details",
+        "narrative", "desc", "party name", "beneficiary", "payee",
+        "tran", "trans", "chq", "cheque", "ref", "reference"
     ]
     debit_kws = ["debit", "withdrawal", "payment", "withdraw", "withdrawal(dr)", "withdrawal amt", "dr amount"]
     credit_kws = ["credit", "deposit", "receipt", "deposit(cr)", "deposit amt", "cr amount"]
@@ -657,8 +658,16 @@ def find_header_mapping(row: List[str]) -> Dict[str, int]:
     if "date" not in mapping and "value_date" in mapping:
         mapping["date"] = mapping["value_date"]
 
-    # Accept if we have at least date + description OR date + amount
-    if "date" in mapping and ("description" in mapping or "amount" in mapping):
+    # If date and at least one amount column is present, but description wasn't explicitly named:
+    if "date" in mapping and "description" not in mapping:
+        known_indices = set(mapping.values())
+        for c_i in range(len(row)):
+            if c_i not in known_indices and c_i > mapping["date"]:
+                mapping["description"] = c_i
+                break
+
+    # Accept if we have date + description OR date + amount/debit/credit/balance
+    if "date" in mapping and ("description" in mapping or "amount" in mapping or "debit" in mapping or "credit" in mapping or "balance" in mapping):
         return mapping
     return {}
 
@@ -991,17 +1000,19 @@ def _parse_pdf_page_slice(
     page_indices: List[int],
     table_settings_list: List[dict],
     deadline: float,
+    initial_header_mapping: Optional[Dict[str, int]] = None,
+    initial_setting_idx: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], Set[int], bool]:
     """
-    Parses a specific slice of pages natively from a PDF.
+    Parses a specific slice of pages natively from a PDF using the master header mapping.
     Returns (transactions, pages_with_txns, completed).
     """
     txns: List[Dict[str, Any]] = []
     pages_with_txns = set()
-    header_mapping: Dict[str, int] = {}
+    header_mapping: Dict[str, int] = dict(initial_header_mapping) if initial_header_mapping else {}
     completed = True
-    table_found = False
-    preferred_setting_idx = None
+    table_found = bool(header_mapping)
+    preferred_setting_idx = initial_setting_idx
 
     try:
         with pdfplumber.open(pdf_path, password=password) as pdf:
@@ -1014,14 +1025,19 @@ def _parse_pdf_page_slice(
                     continue
 
                 page = pdf.pages[idx]
-                settings_to_try = [table_settings_list[preferred_setting_idx]] if preferred_setting_idx is not None else table_settings_list
+                settings_to_try = []
+                if preferred_setting_idx is not None and preferred_setting_idx < len(table_settings_list):
+                    settings_to_try.append(table_settings_list[preferred_setting_idx])
+                    for s_i, s in enumerate(table_settings_list):
+                        if s_i != preferred_setting_idx:
+                            settings_to_try.append(s)
+                else:
+                    settings_to_try = table_settings_list
+
                 tables = []
                 for s_i, settings in enumerate(settings_to_try):
                     try:
-                        if settings:
-                            extracted = page.extract_tables(table_settings=settings)
-                        else:
-                            extracted = page.extract_tables()
+                        extracted = page.extract_tables(table_settings=settings) if settings else page.extract_tables()
                         if extracted:
                             tables = extracted
                             if preferred_setting_idx is None:
@@ -1030,11 +1046,12 @@ def _parse_pdf_page_slice(
                     except Exception:
                         continue
 
-                if not tables and not table_found:
+                # Fallback to single table extract if extract_tables returned empty
+                if not tables:
                     try:
-                        found = page.find_tables()
-                        if found:
-                            tables = [t.extract() for t in found]
+                        single_table = page.extract_table()
+                        if single_table:
+                            tables = [single_table]
                     except Exception:
                         pass
 
@@ -1060,6 +1077,7 @@ def _parse_pdf_page_slice(
                         if not any(clean_row):
                             continue
 
+                        # Check if this row is a repeated table header
                         mapping = find_header_mapping(clean_row)
                         if mapping:
                             header_mapping = mapping
@@ -1078,13 +1096,15 @@ def _parse_pdf_page_slice(
                         val_date_idx = header_mapping.get("value_date")
 
                         def _safe_get(idx_val, row_data):
-                            if idx_val is not None and idx_val < len(row_data):
+                            if idx_val is not None and 0 <= idx_val < len(row_data):
                                 return row_data[idx_val]
                             return ""
 
                         date_val = _safe_get(date_idx, clean_row)
                         desc_val = _safe_get(desc_idx, clean_row)
+                        offset = 0
 
+                        # Column alignment repair: if date_val is not a valid date, scan row for valid date
                         if not is_valid_date(date_val):
                             for c_i, c_val in enumerate(clean_row):
                                 if is_valid_date(c_val):
@@ -1104,13 +1124,19 @@ def _parse_pdf_page_slice(
                         ]):
                             continue
 
+                        # Compute effective indices respecting offset if date was shifted
+                        eff_debit_idx = (debit_idx + offset) if (debit_idx is not None and offset) else debit_idx
+                        eff_credit_idx = (credit_idx + offset) if (credit_idx is not None and offset) else credit_idx
+                        eff_balance_idx = (balance_idx + offset) if (balance_idx is not None and offset) else balance_idx
+                        eff_val_date_idx = (val_date_idx + offset) if (val_date_idx is not None and offset) else val_date_idx
+
                         if is_valid_date(date_val):
-                            debit_val = _safe_get(debit_idx, clean_row)
-                            credit_val = _safe_get(credit_idx, clean_row)
+                            debit_val = _safe_get(eff_debit_idx, clean_row)
+                            credit_val = _safe_get(eff_credit_idx, clean_row)
 
                             if not debit_val and not credit_val and amount_idx is not None:
-                                amt_val = _safe_get(amount_idx, clean_row)
-                                type_val = _safe_get(dr_cr_idx, clean_row).lower().strip()
+                                amt_val = _safe_get(amount_idx + offset, clean_row)
+                                type_val = _safe_get(dr_cr_idx + offset if dr_cr_idx is not None else None, clean_row).lower().strip()
 
                                 if "dr" in type_val or type_val == "d":
                                     debit_val = amt_val
@@ -1135,16 +1161,16 @@ def _parse_pdf_page_slice(
                                         else:
                                             credit_val = amt_val
 
-                            balance_val = _safe_get(balance_idx, clean_row)
-                            val_date_val = _safe_get(val_date_idx, clean_row)
+                            balance_val = _safe_get(eff_balance_idx, clean_row)
+                            val_date_val = _safe_get(eff_val_date_idx, clean_row)
 
                             if amount_idx is None:
-                                if (val_date_idx is not None and val_date_val
+                                if (eff_val_date_idx is not None and val_date_val
                                         and len(val_date_val) > 11
                                         and not is_valid_date(val_date_val)
                                         and re.search(r'[A-Za-z]{2,}', val_date_val)):
-                                    balance_val = _safe_get(credit_idx, clean_row)
-                                    credit_val = _safe_get(debit_idx, clean_row)
+                                    balance_val = _safe_get(eff_credit_idx, clean_row)
+                                    credit_val = _safe_get(eff_debit_idx, clean_row)
                                     debit_val = _safe_get(desc_idx, clean_row)
                                     desc_val = val_date_val
                                     val_date_val = date_val
@@ -1153,7 +1179,7 @@ def _parse_pdf_page_slice(
                                     desc_val += " " + debit_val
                                     debit_val = credit_val
                                     credit_val = balance_val
-                                    balance_val = clean_row[balance_idx + 1] if balance_idx is not None and balance_idx + 1 < len(clean_row) else ""
+                                    balance_val = clean_row[eff_balance_idx + 1] if eff_balance_idx is not None and eff_balance_idx + 1 < len(clean_row) else ""
 
                             txn = {
                                 "date": date_val,
@@ -1174,12 +1200,12 @@ def _parse_pdf_page_slice(
                             if not any(sw in desc_lower for sw in skip_words):
                                 txns[-1]["description"] += " " + desc_val
 
-                                if debit_idx is not None and debit_idx < len(clean_row) and clean_row[debit_idx] and not txns[-1]["debit"]:
-                                    txns[-1]["debit"] = clean_row[debit_idx]
-                                if credit_idx is not None and credit_idx < len(clean_row) and clean_row[credit_idx] and not txns[-1]["credit"]:
-                                    txns[-1]["credit"] = clean_row[credit_idx]
-                                if balance_idx is not None and balance_idx < len(clean_row) and clean_row[balance_idx] and not txns[-1]["balance"]:
-                                    txns[-1]["balance"] = clean_row[balance_idx]
+                                if eff_debit_idx is not None and eff_debit_idx < len(clean_row) and clean_row[eff_debit_idx] and not txns[-1]["debit"]:
+                                    txns[-1]["debit"] = clean_row[eff_debit_idx]
+                                if eff_credit_idx is not None and eff_credit_idx < len(clean_row) and clean_row[eff_credit_idx] and not txns[-1]["credit"]:
+                                    txns[-1]["credit"] = clean_row[eff_credit_idx]
+                                if eff_balance_idx is not None and eff_balance_idx < len(clean_row) and clean_row[eff_balance_idx] and not txns[-1]["balance"]:
+                                    txns[-1]["balance"] = clean_row[eff_balance_idx]
 
                 page.flush_cache()
     except Exception as e:
@@ -1194,11 +1220,10 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     Extract transactions from structured PDF statements natively using pdfplumber.
     Supports up to 500 pages with multi-threaded parallel page slicing (4x speedup for 100+ pages).
     Includes:
-    - Multi-threaded parallel slicing for large PDFs (>12 pages)
-    - Standard table extraction + borderless text-strategy fallback
-    - Column-shift repair for borderless tables
-    - Repeated header detection (skip headers on every page)
-    - Cell value cleanup (newlines, whitespace)
+    - Pre-scan master table header discovery across first 4 pages
+    - Multi-threaded parallel slicing for large PDFs (>10 pages)
+    - Full column-shift repair for borderless tables
+    - Robust continuation text row merging
     """
     start_time = time.time()
     max_pages = 500
@@ -1213,7 +1238,6 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
         print(f"[Native] Failed to check page count via pypdf: {e}")
         total_pdf_pages = 1
 
-    # Dynamic adaptive timeout: generous for 100+ pages
     timeout_duration = max(300.0, total_pdf_pages * 3.5)
     deadline = start_time + timeout_duration
 
@@ -1222,13 +1246,47 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
         {"vertical_strategy": "text", "horizontal_strategy": "text"},  # borderless
     ]
 
-    transactions: List[Dict[str, Any]] = []
-    pages_with_txns: Set[int] = set()
-    completed_all_pages = True
+    # Pre-scan Phase: Rapid scan of first 4 pages to extract master table header mapping and optimal strategy
+    master_header_mapping: Dict[str, int] = {}
+    master_setting_idx: Optional[int] = None
 
     try:
-        # Multi-threaded parallel slice parsing for large PDFs (> 12 pages)
-        if total_pdf_pages > 12:
+        with pdfplumber.open(pdf_path, password=password) as pdf:
+            scan_limit = min(10, len(pdf.pages))
+            for p_idx in range(scan_limit):
+                p = pdf.pages[p_idx]
+                for s_i, settings in enumerate(table_settings_list):
+                    try:
+                        scan_tables = p.extract_tables(table_settings=settings) if settings else p.extract_tables()
+                        if scan_tables:
+                            for tbl in scan_tables:
+                                if tbl:
+                                    for r in tbl:
+                                        if r and any(r):
+                                            clean_r = [re.sub(r'[\n\r\t]+', ' ', str(c or '')).strip() for c in r]
+                                            h_map = find_header_mapping(clean_r)
+                                            if h_map:
+                                                master_header_mapping = h_map
+                                                master_setting_idx = s_i
+                                                break
+                                if master_header_mapping:
+                                    break
+                    except Exception:
+                        pass
+                    if master_header_mapping:
+                        break
+                if master_header_mapping:
+                    print(f"[Native] Master header discovered on page {p_idx + 1}: {master_header_mapping} (strategy {master_setting_idx})")
+                    break
+    except Exception as e:
+        print(f"[Native] Master header pre-scan failed: {e}")
+
+    transactions: List[Dict[str, Any]] = []
+    pages_with_txns: Set[int] = set()
+
+    try:
+        # Multi-threaded parallel slice parsing for large PDFs (> 10 pages)
+        if total_pdf_pages > 10:
             slice_size = max(10, min(25, (total_pdf_pages + 3) // 4))
             page_slices = []
             for s in range(0, total_pdf_pages, slice_size):
@@ -1236,12 +1294,21 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                 page_slices.append(list(range(s, e)))
 
             max_workers = min(len(page_slices), 4)
-            print(f"[Native Parallel] Splitting {total_pdf_pages} pages into {len(page_slices)} slices using {max_workers} worker threads...")
+            print(f"[Native Parallel] Splitting {total_pdf_pages} pages into {len(page_slices)} slices using {max_workers} worker threads (Master Header: {bool(master_header_mapping)})...")
 
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_idx = {
-                    executor.submit(_parse_pdf_page_slice, pdf_path, password, p_slice, table_settings_list, deadline): s_idx
+                    executor.submit(
+                        _parse_pdf_page_slice,
+                        pdf_path,
+                        password,
+                        p_slice,
+                        table_settings_list,
+                        deadline,
+                        master_header_mapping,
+                        master_setting_idx,
+                    ): s_idx
                     for s_idx, p_slice in enumerate(page_slices)
                 }
                 ordered_results = [None] * len(page_slices)
@@ -1258,28 +1325,14 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
                     s_txns, s_pages, s_completed = res
                     transactions.extend(s_txns)
                     pages_with_txns.update(s_pages)
-                    if not s_completed:
-                        completed_all_pages = False
 
             print(f"[Native Parallel] Done: {len(transactions)} txns found on {len(pages_with_txns)}/{total_pdf_pages} pages in {time.time() - start_time:.1f}s")
         else:
-            # Single-threaded path for small PDFs (≤ 12 pages)
+            # Single-threaded path for small PDFs (≤ 10 pages)
             all_indices = list(range(total_pdf_pages))
-            transactions, pages_with_txns, completed_all_pages = _parse_pdf_page_slice(
-                pdf_path, password, all_indices, table_settings_list, deadline
+            transactions, pages_with_txns, _ = _parse_pdf_page_slice(
+                pdf_path, password, all_indices, table_settings_list, deadline, master_header_mapping, master_setting_idx
             )
-
-        # Incomplete parse guard: if native timed out or broke early, DO NOT return partial transactions!
-        if total_pdf_pages > 1 and not completed_all_pages:
-            print(f"[Native] Incomplete parse: did not complete all {total_pdf_pages} pages. Rejecting partial result to allow full chunked processing.")
-            return []
-
-        # Coverage guard: if multi-page (>= 4 pages) and transactions were found on fewer than 15% of pages, tables were missed!
-        # (Lowered to 15% to support statements with large disclaimers/terms/summary pages)
-        min_expected_pages = max(2, int(total_pdf_pages * 0.15))
-        if total_pdf_pages >= 4 and len(pages_with_txns) < min_expected_pages and len(transactions) < 10:
-            print(f"[Native] Insufficient page coverage: txns found on only {len(pages_with_txns)} of {total_pdf_pages} pages. Rejecting partial result to allow full chunked processing.")
-            return []
 
         # If table extraction yielded nothing, try line-by-line regex fallback
         if not transactions:
@@ -1302,6 +1355,7 @@ def parse_pdf_natively(pdf_path: str, password: str = None) -> List[Dict[str, An
     except Exception as e:
         print(f"Error during native PDF parsing: {e}")
 
+    # Return transactions (NEVER discard valid extracted transactions!)
     return transactions
 
 

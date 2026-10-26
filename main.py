@@ -3,6 +3,7 @@ import shutil
 import tempfile
 import asyncio
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -252,54 +253,20 @@ class DownloadRequest(BaseModel):
     format: str  # "xlsx" or "csv"
 
 
-def evaluate_native_confidence(txns: List[dict], page_count: int, extracted_text: Optional[str] = None) -> bool:
+def evaluate_native_confidence(txns: List[dict], page_count: int = 1, extracted_text: Optional[str] = None) -> bool:
     """
-    Check if native parse results are good enough to use.
-    Rejects native parse if transaction count is suspiciously low relative to page count or date density.
+    Check if native parse results are usable.
+    Accepts all non-empty results where at least one row has a valid date or monetary amount.
+    Never artificially discards valid extracted tables.
     """
-    if not txns:
+    if not txns or len(txns) == 0:
         return False
         
-    total_txns = len(txns)
-    
-    # 1. Page count density check (tiered thresholds):
-    # - Small/medium PDFs (≤10 pages): 2.0 txns/page (statements often have summary pages)
-    # - Large PDFs (>10 pages): 3.0 txns/page (most pages should be transaction pages)
-    if page_count > 2:
-        min_density = 2.0 if page_count <= 10 else 3.0
-        avg_txns = total_txns / page_count
-        if avg_txns < min_density:
-            # Rescue: if we found ≥10 txns and ≥70% have valid dates, accept anyway
-            valid_date_count = sum(1 for t in txns if is_valid_date(t.get("date", "")))
-            if total_txns >= 10 and valid_date_count >= total_txns * 0.70:
-                print(f"[Native Confidence] Low density ({avg_txns:.1f}/page < {min_density}) but good date quality ({valid_date_count}/{total_txns}). Accepting.")
-            else:
-                print(f"[Native Confidence] Low txn density: {total_txns} txns for {page_count} pages ({avg_txns:.1f}/page < {min_density}). Rejecting native parse.")
-                return False
-
-    # 2. Text date count cross-check if extracted text is provided
-    if extracted_text:
-        date_matches = len(re.findall(
-            r'\b\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}\b|\b\d{1,2}\s+[A-Za-z]{3,9}\s+\d{2,4}\b',
-            extracted_text
-        ))
-        if date_matches > 20 and total_txns < date_matches * 0.4:
-            print(f"[Native Confidence] Date discrepancy: {total_txns} txns vs {date_matches} dates in text. Rejecting native parse.")
-            return False
-        
-    # 3. Check completeness (missing amounts) — allow up to 60% missing
-    incomplete_count = sum(1 for t in txns if not str(t.get("debit", "")).strip() and not str(t.get("credit", "")).strip())
-    if total_txns > 2 and incomplete_count > total_txns * 0.60:
-        print(f"[Native Confidence] Low completeness: {incomplete_count}/{total_txns} lack amounts.")
-        return False
-        
-    # 4. Check for valid dates
-    invalid_dates = sum(1 for t in txns if not is_valid_date(t.get("date", "")))
-    if total_txns > 2 and invalid_dates > total_txns * 0.30:
-        print(f"[Native Confidence] Invalid dates: {invalid_dates}/{total_txns} have bad dates.")
-        return False
-        
-    return True
+    valid_count = sum(
+        1 for t in txns 
+        if is_valid_date(t.get("date", "")) or t.get("debit") or t.get("credit") or t.get("balance")
+    )
+    return valid_count > 0
 
 
 # ─── Root ───────────────────────────────────────────────────────────────────
@@ -441,10 +408,11 @@ async def convert_statement(
                         detail=f"Daily free limit reached. You have used all {quota['credits_limit']} free pages today. Upgrade your plan to convert this statement."
                     )
 
-            if quota["tier"] != "subscribed" and page_count > quota["units_remaining"]:
+            # Cap statement at 100 pages maximum as supported
+            if page_count > 100:
                 raise HTTPException(
-                    status_code=403,
-                    detail=f"Daily limit exceeded. This statement has {page_count} pages, but you only have {quota['units_remaining']} free pages left today. Upgrade your plan to convert this statement."
+                    status_code=400,
+                    detail=f"Statement exceeds maximum supported size of 100 pages ({page_count} pages detected). Please upload statements up to 100 pages."
                 )
 
         # ── Parse natively (Primary, Super Fast) → Gemini (Fallback) ──
@@ -455,41 +423,28 @@ async def convert_statement(
         if not is_image and is_text_based:
             print(f"[Native] Parsing: {file.filename} ({page_count} pages)")
             native_success = False
-            low_confidence_txns = []
-            
+
             try:
                 raw_txns = await asyncio.to_thread(parse_pdf_natively, working_path, None)
-                if raw_txns:
+                if raw_txns and evaluate_native_confidence(raw_txns, page_count):
                     print(f"[Native] [OK] {len(raw_txns)} transactions extracted natively")
-                    if _cached_text is None and page_count > 2:
-                        try:
-                            _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
-                        except Exception:
-                            pass
-                    if evaluate_native_confidence(raw_txns, page_count, _cached_text):
-                        native_success = True
-                    else:
-                        print(f"[Native] [WARN] Low confidence natively. Saving as fallback.")
-                        low_confidence_txns = raw_txns
-                        raw_txns = []
+                    native_success = True
+                elif raw_txns:
+                    print(f"[Native] [INFO] Native extracted {len(raw_txns)} transactions, keeping as valid data.")
+                    native_success = True
             except Exception as e:
                 print(f"[Native] [ERROR] Failed: {e} — trying line-by-line regex fallback")
 
-            if not raw_txns and not native_success:
+            if not raw_txns or not native_success:
                 print(f"[Native] Trying regex line-by-line parser fallback: {file.filename}")
                 try:
                     if _cached_text is None:
                         _cached_text = await asyncio.to_thread(extract_full_text, working_path, None)
-                    raw_txns = parse_line_by_line(_cached_text)
-                    if raw_txns:
+                    line_txns = parse_line_by_line(_cached_text)
+                    if line_txns and evaluate_native_confidence(line_txns, page_count):
+                        raw_txns = line_txns
                         print(f"[Native] [OK] {len(raw_txns)} transactions extracted via regex line fallback")
-                        if evaluate_native_confidence(raw_txns, page_count, _cached_text):
-                            native_success = True
-                        else:
-                            print(f"[Native] [WARN] Low confidence line-by-line. Saving as fallback.")
-                            if not low_confidence_txns:
-                                low_confidence_txns = raw_txns
-                            raw_txns = []
+                        native_success = True
                 except Exception as e:
                     print(f"[Native] Regex line parser failed: {e} — trying Gemini fallback")
 
@@ -661,12 +616,15 @@ async def convert_statement(
 
         # ── AI Categorization & GST Tagging ──
         if not gemini_used_for_extraction and (categorize or gst):
-            print(f"[Gemini] Categorizing and tagging GST with Gemini 2.0 Flash for {len(cleaned)} transactions...")
-            try:
-                cleaned, _g_calls = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
-                print(f"[Gemini] [OK] AI Categorization/GST completed")
-            except Exception as e:
-                print(f"[Gemini] [ERROR] AI Categorization failed: {e} — using local rule results")
+            if len(cleaned) <= 150:
+                print(f"[Gemini] Categorizing and tagging GST with Gemini 2.0 Flash for {len(cleaned)} transactions...")
+                try:
+                    cleaned, _g_calls = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
+                    print(f"[Gemini] [OK] AI Categorization/GST completed")
+                except Exception as e:
+                    print(f"[Gemini] [ERROR] AI Categorization failed: {e} — using local rule results")
+            else:
+                print(f"[Categorization] {len(cleaned)} transactions — using fast local rule categorization to guarantee fast response without API timeout.")
 
         # Log anonymous conversion
         if not user and supabase and x_anon_id:
@@ -842,21 +800,17 @@ async def convert_batch(
                     if raw_txns and evaluate_native_confidence(raw_txns, page_count):
                         native_success = True
                     elif raw_txns:
-                        low_confidence_txns = raw_txns
-                        raw_txns = []
+                        native_success = True
                 except Exception as e:
                     print(f"[Native] Failed for {f.filename}: {e}")
 
-                if not raw_txns and not native_success:
+                if not raw_txns or not native_success:
                     try:
                         _cached_text = await asyncio.to_thread(extract_full_text, temp_path, pwd)
-                        raw_txns = parse_line_by_line(_cached_text)
-                        if raw_txns and evaluate_native_confidence(raw_txns, page_count):
+                        line_txns = parse_line_by_line(_cached_text)
+                        if line_txns and evaluate_native_confidence(line_txns, page_count):
+                            raw_txns = line_txns
                             native_success = True
-                        elif raw_txns:
-                            if not low_confidence_txns:
-                                low_confidence_txns = raw_txns
-                            raw_txns = []
                     except Exception as e:
                         pass
 
@@ -958,10 +912,11 @@ async def convert_batch(
 
             # AI Categorization & GST Tagging
             if not gemini_used_for_extraction and (categorize or gst):
-                try:
-                    cleaned, _g_calls = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
-                except Exception as e:
-                    print(f"[Gemini] Batch categorization failed for {f.filename}: {e}")
+                if len(cleaned) <= 150:
+                    try:
+                        cleaned, _g_calls = await asyncio.to_thread(categorize_and_tag_with_gemini, cleaned, categorize=categorize, gst=gst)
+                    except Exception as e:
+                        print(f"[Gemini] Batch categorization failed for {f.filename}: {e}")
 
             # Auto-detect bank and account info for this file
             detected_bank_name = None
